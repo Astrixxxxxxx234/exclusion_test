@@ -2,11 +2,37 @@
     stage2.cpp -- minimal High-integrity registry writer
     No suspicious string literals. Strings built from fragments at runtime.
     Writes diagnostic result file even on failure so caller knows what happened.
+    Only links advapi32 + kernel32 -- no user32, no CRT printf functions.
 
     Compile:
       cl.exe stage2.cpp /O2 /GS- /link advapi32.lib kernel32.lib /subsystem:windows /entry:mainCRTStartup /out:stage2.exe
 */
 #include <windows.h>
+
+// ── Minimal string helpers (no user32 / no CRT printf) ────────────────────────
+
+// Append a DWORD as uppercase hex, zero-padded to `digits` digits
+static void AppendHex(char* dst, DWORD val, int digits) {
+    char buf[9] = {};
+    for (int i = digits - 1; i >= 0; i--) {
+        buf[i] = "0123456789ABCDEF"[val & 0xF];
+        val >>= 4;
+    }
+    buf[digits] = '\0';
+    lstrcatA(dst, buf);
+}
+
+// Append a signed long in decimal
+static void AppendDec(char* dst, LONG val) {
+    char buf[12] = {};
+    int  i = 10;
+    if (val == 0) { buf[0] = '0'; buf[1] = '\0'; lstrcatA(dst, buf); return; }
+    bool neg = (val < 0);
+    LONG v   = neg ? -val : val;
+    while (v > 0) { buf[i--] = (char)('0' + v % 10); v /= 10; }
+    if (neg) buf[i--] = '-';
+    lstrcatA(dst, buf + i + 1);
+}
 
 // Get our process integrity level
 static DWORD MyIntegrity() {
@@ -45,8 +71,8 @@ int main() {
     DWORD integ = MyIntegrity();
     if (integ < 0x3000) {
         // Running at Medium -- elevation didn't work
-        char msg[64];
-        wsprintfA(msg, "FAIL-medium integ=0x%04X\n", integ);
+        char msg[64] = {};
+        lstrcatA(msg, "FAIL-medium integ=0x"); AppendHex(msg, integ, 4); lstrcatA(msg, "\n");
         WriteResultFile(rf, msg);
         return 1;
     }
@@ -72,8 +98,10 @@ int main() {
                             REG_OPTION_NON_VOLATILE, KEY_SET_VALUE,
                             nullptr, &hk, nullptr);
     if (r != ERROR_SUCCESS) {
-        char msg[64];
-        wsprintfA(msg, "FAIL-regopen err=%ld integ=0x%04X\n", r, integ);
+        char msg[64] = {};
+        lstrcatA(msg, "FAIL-regopen err="); AppendDec(msg, r);
+        lstrcatA(msg, " integ=0x");         AppendHex(msg, integ, 4);
+        lstrcatA(msg, "\n");
         WriteResultFile(rf, msg);
         return 1;
     }
@@ -85,11 +113,14 @@ int main() {
     RegCloseKey(hk);
 
     // Report result
-    char msg[128];
+    char msg[128] = {};
     if (r1 == ERROR_SUCCESS && r2 == ERROR_SUCCESS) {
-        wsprintfA(msg, "ok integ=0x%04X\n", integ);
+        lstrcatA(msg, "ok integ=0x"); AppendHex(msg, integ, 4); lstrcatA(msg, "\n");
     } else {
-        wsprintfA(msg, "FAIL-setvalue r1=%ld r2=%ld integ=0x%04X\n", r1, r2, integ);
+        lstrcatA(msg, "FAIL-setvalue r1="); AppendDec(msg, r1);
+        lstrcatA(msg, " r2=");              AppendDec(msg, r2);
+        lstrcatA(msg, " integ=0x");         AppendHex(msg, integ, 4);
+        lstrcatA(msg, "\n");
     }
     WriteResultFile(rf, msg);
     return (r1 == 0 && r2 == 0) ? 0 : 1;
