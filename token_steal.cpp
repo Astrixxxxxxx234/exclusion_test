@@ -414,6 +414,24 @@ int main(int argc, char* argv[]) {
     DWORD lvl = MyIntegrity();
     INFO("Current integrity: 0x%04lX (%s)", lvl, IntegrityName(lvl));
 
+    // Check UAC level -- determines if COM elevation can be silent
+    {
+        HKEY hPol = nullptr;
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+                0, KEY_QUERY_VALUE, &hPol) == ERROR_SUCCESS) {
+            DWORD consent = 99, len = sizeof(consent);
+            RegQueryValueExA(hPol, "ConsentPromptBehaviorAdmin",
+                             nullptr, nullptr, (BYTE*)&consent, &len);
+            RegCloseKey(hPol);
+            INFO("UAC ConsentPromptBehaviorAdmin = %lu", consent);
+            if (consent <= 2)
+                OK("UAC at default level -- COM elevation (ICMLuaUtil) should be SILENT");
+            else
+                WARN("UAC at level %lu (>2) -- every elevation will PROMPT, ICMLuaUtil will ask for consent", consent);
+        }
+    }
+
     // Stage 1: already elevated
     if (lvl >= 0x3000) {
         OK("Already at High integrity -- writing directly");

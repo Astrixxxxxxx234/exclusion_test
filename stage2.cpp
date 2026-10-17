@@ -67,7 +67,12 @@ int main() {
     lstrcatA(rf, "test\\");   lstrcatA(rf, "excl");
     lstrcatA(rf, "usion_r");  lstrcatA(rf, "esult.txt");
 
-    // Check our integrity level first -- write it to result regardless
+    // *** WRITE IMMEDIATELY so caller knows the process ran at all ***
+    // Overwritten with final result below. If result file = "started",
+    // the process ran but was killed before finishing.
+    WriteResultFile(rf, "started\n");
+
+    // Check our integrity level
     DWORD integ = MyIntegrity();
     if (integ < 0x3000) {
         // Running at Medium -- elevation didn't work
