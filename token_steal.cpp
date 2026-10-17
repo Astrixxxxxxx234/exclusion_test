@@ -14,6 +14,7 @@
 
 #include <windows.h>
 #include <tlhelp32.h>
+#include <sddl.h>
 #include <stdio.h>
 #include <string>
 #include <ctime>
