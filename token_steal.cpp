@@ -12,7 +12,7 @@
       -> Writes directly to HKLM Defender exclusion registry keys
 
     Compile:
-      cl.exe token_steal.cpp /EHsc /link advapi32.lib shell32.lib ole32.lib /out:token_steal.exe
+      cl.exe token_steal.cpp /EHsc /link advapi32.lib shell32.lib ole32.lib user32.lib /out:token_steal.exe
 */
 
 #include <windows.h>
